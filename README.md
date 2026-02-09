@@ -53,6 +53,11 @@ System maintenance scripts for NAS operations: automated backups, disk health mo
 
 **Technologies:** Bash, Python, Docker API
 
+### [docker-stacks/](./docker-stacks/)
+Media and networking docker stack running: Jellyfin-stack, wireguard, gluetun, NGINX
+
+**Technologies:** Docker
+
 ---
 
 ## Technical Skills
