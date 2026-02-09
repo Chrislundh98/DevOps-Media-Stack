@@ -1,6 +1,6 @@
 # Docker Stacks
 
-Production Docker Compose configurations running on a Synology NAS. Two stacks with clear separation of concerns.
+Production Docker Compose configurations running on a NAS. Two stacks with clear separation of concerns.
 
 ## Core Services (`core-services.yml`)
 
