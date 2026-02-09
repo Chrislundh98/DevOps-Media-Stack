@@ -1,0 +1,312 @@
+networks:
+  shared_network:
+    name: shared_network
+    external: true
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    restart: unless-stopped
+    env_file: ./.env
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8080:8080"
+      - "7878:7878"
+      - "8989:8989"
+      - "9696:9696"
+      - "6767:6767"
+      - "7474:7474"
+      - "8191:8191"
+      - "2468:2468"
+      - "41487:41487/tcp"
+      - "41487:41487/udp"
+    volumes:
+      - /volume1/docker/appdata/gluetun:/gluetun
+      - /volume1/docker/appdata/gluetun/wg0.conf:/gluetun/wireguard/wg0.conf
+    environment:
+      - TZ=Europe/Stockholm
+      - PUID=1000
+      - PGID=1000
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=wireguard
+      
+      - DNS_ADDRESS=1.1.1.1
+      - FIREWALL_VPN_INPUT_PORTS=41487
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/24,10.13.13.0/24,185.248.102.72/32
+      - UPDATER_PERIOD=24h
+      - LOG_LEVEL=info
+    networks:
+      - shared_network
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    volumes:
+      - /volume1/docker/appdata/radarr:/config
+      - /volume2/media/movies:/media/movies
+      - /volume2/media/concerts:/media/concerts
+      - /volume2/data/downloads:/downloads
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    deploy:
+      resources:
+        limits:
+          memory: '2G'
+        reservations:
+          memory: '256M'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7878/api/v3/system/status"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    volumes:
+      - /volume1/docker/appdata/sonarr:/config
+      - /volume2/media/series:/media/series
+      - /volume2/data/downloads:/downloads
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    deploy:
+      resources:
+        limits:
+          memory: '2G'
+        reservations:
+          memory: '256M'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8989/api/v3/system/status"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    volumes:
+      - /volume1/docker/appdata/prowlarr:/config
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - LOG_LEVEL=info
+      - CAPTCHA_SOLVER=none
+      - NO_SANDBOX=true
+    volumes:
+      - /dev/shm:/dev/shm
+    cap_add:
+      - SYS_ADMIN
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - WEBUI_PORT=8080
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:qbittorrent
+      - TP_THEME=dark
+    volumes:
+      - /volume1/docker/appdata/qbittorrent:/config
+      - /volume2/data/downloads:/downloads
+      - /volume2/data/cross-seed-links:/cross-seed-links
+      - /volume2/media/movies:/media/movies
+      - /volume2/media/series:/media/series
+      - /volume2/media/concerts:/media/concerts
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+
+  autobrr:
+    image: ghcr.io/autobrr/autobrr:latest
+    container_name: autobrr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    volumes:
+      - /volume1/docker/appdata/autobrr:/config
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr
+    restart: unless-stopped
+    ports:
+      - "8265:8265"
+      - "8266:8266"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - serverIP=0.0.0.0
+    volumes:
+      - /volume1/docker/appdata/tdarr:/app/server
+      - /volume1/docker/appdata/tdarr/configs:/app/configs
+      - /volume1/docker/appdata/tdarr/logs:/app/logs
+      - /volume2/media/movies:/media/movies
+      - /volume2/media/series:/media/series
+      - /volume2/media/concerts:/media/concerts
+      - /volume1/tdarr_cache:/temp
+    networks:
+      - shared_network
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    volumes:
+      - /volume1/docker/appdata/bazarr:/config
+      - /volume2/media/movies:/media/movies
+      - /volume2/media/series:/media/series
+      - /volume2/data/downloads:/downloads
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+
+  makemkv:
+    image: ghcr.io/jlesage/makemkv:latest
+    container_name: makemkv
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    ports:
+      - '5800:5800'
+    volumes:
+      - /volume1/docker/appdata/makemkv:/config
+      - /volume2/media/movies:/storage:ro
+      - /volume2/data/remuxed:/output
+    networks:
+      - shared_network
+
+  mkvtoolnix:
+    image: ghcr.io/jlesage/mkvtoolnix:latest
+    container_name: mkvtoolnix
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    ports:
+      - '5801:5800'
+    volumes:
+      - /volume1/docker/appdata/mkvtoolnix:/config
+      - /volume2/data:/data
+      - /volume2/media:/media
+    networks:
+      - shared_network
+
+  unpackerr:
+    image: ghcr.io/unpackerr/unpackerr:latest
+    container_name: unpackerr
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - UN_MASK=002
+      - UN_SONARR_0_URL=http://gluetun:8989
+      - UN_RADARR_0_URL=http://gluetun:7878
+      - UN_SONARR_0_API_KEY=${UN_SONARR_0_API_KEY}
+      - UN_RADARR_0_API_KEY=${UN_RADARR_0_API_KEY}
+    volumes:
+      - /volume2/data/downloads:/downloads
+    networks:
+      - shared_network
+    depends_on:
+      - sonarr
+      - radarr
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: '1G'
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: "1000:1000"
+    group_add:
+      - "105"
+    restart: unless-stopped
+    ports:
+      - 8096:8096/tcp
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+    volumes:
+      - /volume1/docker/appdata/jellyfin:/config
+      - /volume1/docker/appdata/jellyfin/cache:/cache
+      - /volume2/media/series:/media/series
+      - /volume2/media/movies:/media/movies
+      - /volume2/media/concerts:/media/concerts
+    devices:
+      - /dev/dri:/dev/dri
+    networks:
+      shared_network:
+        ipv4_address: 172.18.0.15
+    
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    restart: unless-stopped
+    ports:
+      - 5056:5055
+    environment:
+      - LOG_LEVEL=debug
+      - TZ=Europe/Stockholm
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - /volume1/docker/appdata/jellyseerr:/app/config
+    networks:
+      - shared_network
+    

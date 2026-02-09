@@ -1,0 +1,132 @@
+networks:
+  shared_network:
+    name: shared_network
+    external: true
+
+services:
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginxproxymanager
+    restart: unless-stopped
+    ports:
+      - '8081:80'
+      - '8443:443'
+      - '81:81'
+    volumes:
+      - /volume1/docker/appdata/nginxproxymanager/data:/data
+      - /volume1/docker/appdata/nginxproxymanager/letsencrypt:/etc/letsencrypt
+    networks:
+      shared_network:
+        ipv4_address: 172.18.0.12
+
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: wireguard
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    ports:
+      - '51820:51820/udp'
+    volumes:
+      - /volume1/docker/appdata/wireguard:/config
+      - /lib/modules:/lib/modules
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - SERVERURL=${PUBLIC_IP}
+      - PEERS=8
+      - INTERNAL_SUBNET=10.13.13.0/24
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+
+  wireguard-admin:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: wireguard-admin
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    ports:
+      - '51821:51820/udp'
+    volumes:
+      - /volume1/docker/appdata/wireguard-admin:/config
+      - /lib/modules:/lib/modules
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - SERVERURL=${PUBLIC_IP}
+      - SERVERPORT=51821  
+      - PEERS=3
+      - PEERDNS=auto
+      - INTERNAL_SUBNET=10.14.14.0/24 
+      - ALLOWEDIPS=0.0.0.0/0
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - shared_network
+
+  glances:
+    image: nicolargo/glances:latest-full
+    container_name: glances
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/host:ro
+    environment:
+      - GLANCES_OPT=-w
+  
+  wizarr:
+    container_name: wizarr
+    image: ghcr.io/wizarrrr/wizarr:latest
+    restart: unless-stopped
+    ports:
+      - "5690:5690"
+    volumes:
+      - /volume1/docker/appdata/wizarr:/data
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Stockholm
+      - DISABLE_BUILTIN_AUTH=false
+    networks:
+      - shared_network
+    
+  jellystat:
+    image: cyfershepard/jellystat:latest
+    container_name: jellystat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - POSTGRES_USER=${JS_DB_USER}
+      - POSTGRES_PASSWORD=${JS_DB_PASSWORD}
+      - POSTGRES_IP=jellystat-db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${JS_DB_NAME}
+      - JWT_SECRET=${JS_JWT_SECRET}
+      - TZ=${JS_TZ}
+      - JF_USE_WEBSOCKETS=false
+    ports:
+      - "${JS_PORT}:3000"
+    networks:
+      - shared_network
+    depends_on:
+      - jellystat-db
+
+  jellystat-db:
+    image: postgres:15-alpine
+    container_name: jellystat-db
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - POSTGRES_USER=${JS_DB_USER}
+      - POSTGRES_PASSWORD=${JS_DB_PASSWORD}
+      - POSTGRES_DB=${JS_DB_NAME}
+    volumes:
+      - /volume1/docker/appdata/jellystat/db:/var/lib/postgresql/data
+    networks:
+      - shared_network
