@@ -1,0 +1,52 @@
+services:
+  force-seeder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: force-seeder
+    restart: unless-stopped
+    command: >
+      bash -c 'while true; do python -m qbittorrent.seeder; sleep 1800; done'
+    volumes:
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+    env_file:
+      - ../../.env
+    networks:
+      - automation
+
+  big-queue:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: big-queue
+    restart: unless-stopped
+    command: >
+      bash -c 'while true; do python -m qbittorrent.queue; sleep 900; done'
+    volumes:
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+    env_file:
+      - ../../.env
+    networks:
+      - automation
+
+  announcer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: announcer
+    restart: unless-stopped
+    command: python -m qbittorrent.announcer
+    volumes:
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+    env_file:
+      - ../../.env
+    networks:
+      - automation
+
+networks:
+  automation:
+    name: automation
+    external: false

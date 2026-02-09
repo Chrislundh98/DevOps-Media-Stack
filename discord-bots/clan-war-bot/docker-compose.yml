@@ -1,0 +1,13 @@
+services:
+  coc-war-bot:
+    build: .
+    container_name: coc-war-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - /volume1/automation/bots/coc-war/logs:/app/logs
+    environment:
+      - TZ=Europe/Stockholm
+      - LOG_DIR=/app/logs

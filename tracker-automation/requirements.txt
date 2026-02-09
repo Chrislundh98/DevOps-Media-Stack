@@ -1,0 +1,8 @@
+qbittorrent-api>=2024.1.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+selenium>=4.15.0
+undetected-chromedriver>=3.5.4
+webdriver-manager>=4.0.1
+bencodepy>=0.9.5
+tqdm>=4.66.0

@@ -1,0 +1,38 @@
+# Environment and secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Logs
+*.log
+logs/
+
+# Data and state
+*.db
+*.sqlite
+*.json
+!requirements.txt
+!package.json
+
+# Chrome profiles
+chrome_profile*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

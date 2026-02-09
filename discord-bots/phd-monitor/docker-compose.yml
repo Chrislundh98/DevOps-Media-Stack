@@ -1,0 +1,20 @@
+services:
+  phd-monitor:
+    build: .
+    container_name: phd-monitor
+    restart: unless-stopped
+    volumes:
+      # Persist state across container restarts
+      - ./state:/app/state
+    environment:
+      # Optionally override webhook URL
+      - DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
+      
+      # Timezone for logging
+      - TZ=Europe/Stockholm
+    # Resource limits - very lightweight
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
