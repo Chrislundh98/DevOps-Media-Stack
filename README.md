@@ -2,7 +2,7 @@
 
 **Automation Engineer | Cybersecurity Student | Infrastructure Developer**
 
-Jonkoping University, Sweden | MSc Cybersecurity (ongoing) | BSc Computer Engineering
+Jönköping University, Sweden | MSc Cybersecurity (ongoing) | BSc Computer Engineering and Informatics
 
 ---
 
@@ -10,7 +10,15 @@ Jonkoping University, Sweden | MSc Cybersecurity (ongoing) | BSc Computer Engine
 
 I design and maintain automated infrastructure that runs 24/7 on self-hosted hardware. This repository contains production code from systems I have built, deployed, and operate daily. Every project here solves a real problem and has been refined through months of iteration.
 
-My background spans networking (Cisco CCNA, Telia NOC), system administration (Linux, Docker, NAS architecture), cybersecurity (published researcher, CTF competitor, co-founder of pwnJU), and full-stack automation with Python.
+My background spans networking (Cisco CCNA, Telia NOC), system administration (Linux, Docker, NAS & Cloud architecture), cybersecurity (published researcher, CTF competitor, co-founder of pwnJU), and full-stack automation with Python.
+
+## Publications
+
+### [Evaluating Security and Data Privacy in Smart Home Devices](https://ceur-ws.org/Vol-4134/paper27.pdf)
+**Conference:** 11th International Workshop on Socio-Technical Perspectives in Information Systems (STPIS 2025)
+*Natalia Khetagourova, Christoffer Lundh, Joakim Kävrestad*
+
+Critically evaluated the data privacy and security practices of smart-home IoT devices, specifically those self-declaring CE compliance under EU RED directive 2014/53/EU. Analyzed network traffic and privacy policies to identify discrepancies between stated and actual data handling practices.
 
 ---
 
