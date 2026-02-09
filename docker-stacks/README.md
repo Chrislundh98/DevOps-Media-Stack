@@ -58,14 +58,3 @@ Internet
 ```
 
 All download-related services use `network_mode: service:gluetun` to ensure traffic is routed through the VPN. If the VPN drops, these services lose network access entirely (kill switch behavior).
-
-## Setup
-```bash
-docker network create shared_network --subnet=172.18.0.0/16
-
-cp core.env.template core/.env
-cp media.env.template media/.env
-
-cd core && docker compose up -d
-cd ../media && docker compose up -d
-```
