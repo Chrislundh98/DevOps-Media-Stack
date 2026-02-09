@@ -72,18 +72,3 @@ QBIT_PASS=your_password
 DISCORD_TORRENT_HOOK=https://discord.com/api/webhooks/...
 DISCORD_STATS_HOOK=https://discord.com/api/webhooks/...
 ```
-
-## Deployment
-
-Browser-based scripts run on the host (require Chrome 141 + undetected-chromedriver for Cloudflare bypass). qBittorrent utilities run in Docker containers.
-
-```bash
-# Start Docker services
-cd docker && docker compose up -d
-
-# Host cron (example)
-0 */2 * * * /path/to/scripts/run_tl_monitor.sh
-30 */2 * * * /path/to/scripts/run_dc_monitor.sh
-55 7 * * * /path/to/scripts/run_tl_reporter.sh
-0 8 * * * /path/to/scripts/run_dc_reporter.sh
-```
