@@ -58,6 +58,11 @@ Media and networking docker stack running: Jellyfin-stack, wireguard, gluetun, N
 
 **Technologies:** Docker, YML
 
+### [documentation/](./documentation/)
+Useful documentation such as commands, guides, patterns, and other useful server management and development tools.
+
+**Technologies:** Bash, Docker, Python, Git
+
 ---
 
 ## Technical Skills
