@@ -20,23 +20,12 @@ from bs4 import BeautifulSoup
 TARGET_URL = "https://www.cybercampus.se/en/research/cybercampus-graduate"
 CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 STATE_FILE = Path("/app/state/state.json")
-DISCORD_WEBHOOK_URL = os.environ.get(
-    "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
-)
-
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
 # Universities to monitor - add more as needed
 MONITORED_UNIVERSITIES = [
     "Jönköping University",
 ]
 
-# For testing: set via environment variable
-# TEST_MODE=karlstad will monitor Karlstad University instead (which has an active link)
-TEST_MODE = os.environ.get("TEST_MODE", "").lower()
-
-if TEST_MODE == "karlstad":
-    MONITORED_UNIVERSITIES = ["Karlstad University"]
-    logging.info("TEST MODE: Monitoring Karlstad University (has active link)")
 
 # Setup logging
 logging.basicConfig(
