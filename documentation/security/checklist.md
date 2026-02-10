@@ -20,7 +20,7 @@ project/
 **.env:**
 ```
 DISCORD_TOKEN=MTQ2MDI1NjgxOTIy...
-API_KEY=f8ada168a11c49369420931f08ceb561
+API_KEY=abc123def1337
 ```
 
 **.env.example:**

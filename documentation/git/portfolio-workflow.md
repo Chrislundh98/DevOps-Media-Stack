@@ -128,10 +128,10 @@ cd /volume1/portfolio && \
 
 ```bash
 # Feature
-git commit -m "Add: CWL bonus medal recommendations"
+git commit -m "Add: Added new feature"
 
 # Bug fix
-git commit -m "Fix: false positive on anime torrents with season packs"
+git commit -m "Fix: false positive on torrents with season packs"
 
 # Update/improvement
 git commit -m "Update: bandwidth manager threshold to 80 Mbps"
@@ -152,14 +152,6 @@ git commit -m "Remove: deprecated chrome profile cleanup"
 
 When copying code to your portfolio, watch out for hardcoded fallback values:
 
-**Bad (from phd-monitor):**
-```python
-DISCORD_WEBHOOK_URL = os.environ.get(
-    "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/1469040.../real_token_here"  # ← NO!
-)
-```
-
 **Good:**
 ```python
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -177,8 +169,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 ## If You Accidentally Push Secrets
 
-Don't panic. Act fast:
-
+Act fast:
 ```bash
 # 1. Immediately rotate the exposed credentials
 #    (change passwords, regenerate tokens/API keys/webhooks)

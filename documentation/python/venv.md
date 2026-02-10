@@ -72,32 +72,9 @@ pip install -r requirements.txt
 
 ---
 
-## venv in Docker
+## venv for Scripts
 
-You generally DON'T need a venv inside Docker — the container IS the isolation. Just install directly:
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "bot.py"]
-```
-
-If you DO use a venv in Docker (e.g., for NAS scripts that run outside containers), make sure the Dockerfile activates it:
-
-```dockerfile
-RUN python -m venv /app/venv
-ENV PATH="/app/venv/bin:$PATH"
-RUN pip install -r requirements.txt
-```
-
----
-
-## venv for NAS Scripts (Non-Docker)
-
-For scripts that run directly on the NAS (not in Docker):
+For scripts that run directly on the server:
 
 ```bash
 cd /volume1/automation/trackers
