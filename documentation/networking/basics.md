@@ -72,7 +72,6 @@ netstat -tnp                     # Alternative (older tool)
 | 8265 | Tdarr |
 | 8989 | Sonarr |
 | 9696 | Prowlarr |
-| 32400 | Plex |
 
 ---
 
@@ -101,7 +100,7 @@ curl -L https://short.url/abc
 
 ---
 
-## Firewall (ufw — if available)
+## Firewall (ufw)
 
 ```bash
 sudo ufw status                  # Check firewall status
@@ -117,7 +116,6 @@ sudo ufw delete allow 3000/tcp   # Remove a rule
 ## Bandwidth & Traffic
 
 ```bash
-# Monitor bandwidth in real-time (if installed)
 iftop                            # Live bandwidth per connection
 nethogs                          # Bandwidth per process
 vnstat                           # Traffic statistics over time
