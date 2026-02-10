@@ -5,6 +5,7 @@ Interview Transcription System
 Structured interview transcription using faster-whisper with automatic
 CUDA/CPU detection. Produces clean Q&A formatted output with timestamps,
 speaker detection, and optional interview guide matching.
+
 """
 
 import argparse
@@ -15,6 +16,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -25,8 +27,8 @@ from typing import Optional
 
 MODEL_SIZE      = "large-v3"    # tiny, base, small, medium, large-v2, large-v3
 LANGUAGE        = "sv"          # ISO 639-1: sv, en, de, fr, es, etc.
-BEAM_SIZE       = 5             # Higher = more accurate, slower (1-10) << CHANGE THIS VALUE FOR BETTER RESULT DEPENDENT ON YOUR HARDWARE
-PAUSE_THRESHOLD = 2.0           # Seconds of silence to detect speaker change
+BEAM_SIZE       = 10             # Higher = more accurate, slower (1-10)
+PAUSE_THRESHOLD = 1.5           # Seconds of silence to detect speaker change
 
 # Context prompt — adjust for your language/interview style
 INITIAL_PROMPT = (
@@ -151,24 +153,87 @@ def parse_interview_guide(path: str) -> list[dict]:
     if not path or not os.path.exists(path):
         return []
 
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+    ext = Path(path).suffix.lower()
 
-    patterns = [
-        r'(?:Q|Fråga|Question|F)\s*(\d+)\s*[:\.]\s*(.+?)(?=(?:Q|Fråga|Question|F)\s*\d+\s*[:\.]|\Z)',
-        r'(\d+)\s*[:\.]\s*(.+?)(?=\d+\s*[:\.]|\Z)',
-    ]
+    if ext == ".docx":
+        try:
+            from docx import Document
+            doc = Document(path)
+            lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        except Exception as e:
+            print(f"WARNING: Could not read guide .docx: {e}")
+            return []
+    else:
+        encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+        content = None
+        for enc in encodings:
+            try:
+                with open(path, "r", encoding=enc) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        if content is None:
+            print(f"WARNING: Could not decode guide file: {path}")
+            return []
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
 
-    for pattern in patterns:
-        matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
-        if matches:
-            return [{"number": int(n), "text": t.strip()} for n, t in matches]
+    # Filter lines to extract actual interview questions.
+    # A question is a line that:
+    #   - Is a real sentence (> 5 words), AND
+    #   - Contains a question mark, OR starts with a question word, OR starts with numbering
+    # Skip: instructions, single-word sub-bullets, headers
+    question_words = {
+        "hur", "vad", "var", "vem", "vilken", "vilka", "vilket", "varför",
+        "när", "kan", "skulle", "är", "finns", "berätta", "beskriv", "förklara",
+        "om", "tycker", "anser", "upplever", "känner",
+        "how", "what", "where", "who", "which", "why", "when", "can",
+        "could", "would", "do", "does", "tell", "describe", "explain",
+    }
 
-    lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
-    return [
-        {"number": i, "text": re.sub(r'^\d+[\.\):\s]+', '', l).strip()}
-        for i, l in enumerate(lines, 1) if l.strip()
-    ]
+    questions = []
+    for line in lines:
+        # Strip numbering prefix
+        cleaned = re.sub(r'^\s*\d+[\.\):\s]+', '', line).strip()
+        if not cleaned:
+            continue
+
+        words = cleaned.split()
+
+        # Skip very short lines (sub-bullets like "Ålder", "typ av arbete")
+        if len(words) < 5:
+            continue
+
+        # Skip instruction lines (typically the first line mentioning "introduktionen")
+        if any(skip in cleaned.lower() for skip in ["introduktion", "nämn i ", "obs:", "note:"]):
+            continue
+
+        first_word = words[0].lower().rstrip(".,;:?!")
+
+        is_question = (
+            "?" in cleaned or
+            first_word in question_words or
+            cleaned.lower().startswith("vad innebär") or
+            cleaned.lower().startswith("om du ")
+        )
+
+        # Short lines (< 8 words) must have a question mark or be a command-style
+        # question (berätta, beskriv, förklara) to qualify
+        command_starters = {"berätta", "beskriv", "förklara", "tell", "describe", "explain"}
+        if len(words) < 8 and "?" not in cleaned and first_word not in command_starters:
+            is_question = False
+
+        if is_question:
+            questions.append({"number": len(questions) + 1, "text": cleaned})
+
+    if questions:
+        print(f"  Interview guide: {len(questions)} questions loaded")
+        for q in questions[:3]:
+            print(f"    Q{q['number']}: {q['text'][:80]}...")
+        if len(questions) > 3:
+            print(f"    ... and {len(questions) - 3} more")
+
+    return questions
 
 
 # ──────────────────────────────────────────────────────────────
@@ -298,20 +363,114 @@ class Transcriber:
         return text
 
     def detect_speakers(self, segments: list[Segment]) -> list[Segment]:
+        """
+        Two-pass speaker detection combining pause analysis with linguistic
+        content scoring. Designed for rapid Swedish interviews where pauses
+        between speakers can be very short.
+        """
         if not segments:
             return []
 
-        turn_points = {
-            i for i in range(1, len(segments))
-            if segments[i].start - segments[i - 1].end >= self.config.pause_for_turn_switch
+        question_starters = {
+            "hur", "vad", "var", "vem", "vilken", "vilka", "vilket", "varför",
+            "när", "kan", "skulle", "har", "är", "tycker", "anser", "upplever",
+            "berätta", "beskriv", "förklara", "om", "finns",
+            "how", "what", "where", "who", "which", "why", "when", "can",
+            "could", "would", "do", "does", "tell", "describe", "explain",
         }
 
-        speaker = "interviewer"
-        segments[0].speaker = speaker
-        for i in range(1, len(segments)):
-            if i in turn_points:
-                speaker = "respondent" if speaker == "interviewer" else "interviewer"
-            segments[i].speaker = speaker
+        question_phrases = [
+            "berätta lite", "berätta om", "hur ser", "hur upplever",
+            "vad tycker", "vad tänker", "vad anser", "hur skulle",
+            "kan du", "skulle du", "hur har", "på vilket sätt",
+            "vad innebär", "vad känner", "hur skulle du",
+            "vilka digitala", "vilka egenskaper", "vad skulle",
+            "om du hade", "om vi tänker",
+            "tell me", "how do you", "what do you", "can you",
+        ]
+
+        answer_indicators = [
+            "ja,", "ja ", "ja men", "absolut", "nej", "jo", "jag",
+            "det är", "det var", "det beror", "det handlar",
+            "vi har", "vi använder", "man får",
+            "yes", "no", "well", "i think", "i believe",
+        ]
+
+        def question_score(text: str) -> float:
+            t = text.lower().strip()
+            words = t.split()
+            if not words:
+                return 0.0
+
+            score = 0.0
+
+            if words[0] in question_starters:
+                score += 0.35
+            if t.endswith("?"):
+                score += 0.35
+            for phrase in question_phrases:
+                if phrase in t:
+                    score += 0.25
+                    break
+
+            if len(words) < 20:
+                score += 0.1
+            if len(words) > 50:
+                score -= 0.3
+
+            return max(0.0, min(1.0, score))
+
+        def answer_score(text: str) -> float:
+            t = text.lower().strip()
+            words = t.split()
+            if not words:
+                return 0.0
+
+            score = 0.0
+
+            for indicator in answer_indicators:
+                if t.startswith(indicator):
+                    score += 0.3
+                    break
+
+            if len(words) > 30:
+                score += 0.3
+            elif len(words) > 15:
+                score += 0.15
+
+            if "?" not in t and len(words) > 10:
+                score += 0.1
+
+            return max(0.0, min(1.0, score))
+
+        # Score all segments
+        q_scores = [question_score(seg.text) for seg in segments]
+        a_scores = [answer_score(seg.text) for seg in segments]
+        gaps = [0.0] + [segments[i].start - segments[i - 1].end for i in range(1, len(segments))]
+
+        # Assign speakers
+        for i, seg in enumerate(segments):
+            qs, ans = q_scores[i], a_scores[i]
+            gap = gaps[i]
+            has_pause = gap >= self.config.pause_for_turn_switch * 0.5
+
+            if i == 0:
+                seg.speaker = "interviewer" if qs > ans else ("respondent" if ans > qs else "interviewer")
+                continue
+
+            prev_speaker = segments[i - 1].speaker
+
+            if has_pause:
+                if qs >= 0.3 and qs > ans:
+                    seg.speaker = "interviewer"
+                elif ans >= 0.3 and ans > qs:
+                    seg.speaker = "respondent"
+                elif gap >= self.config.pause_for_turn_switch:
+                    seg.speaker = "respondent" if prev_speaker == "interviewer" else "interviewer"
+                else:
+                    seg.speaker = prev_speaker
+            else:
+                seg.speaker = prev_speaker
 
         return segments
 
@@ -341,6 +500,39 @@ class Transcriber:
         if current:
             blocks.append(current)
 
+        # Post-process pass 1: merge short false-positive blocks back.
+        # Pattern: Q-A-Q where A has < 8 words → merge all into Q
+        # Pattern: A-Q-A where Q has < 8 words → merge all into A
+        changed = True
+        while changed:
+            changed = False
+            merged = []
+            i = 0
+            while i < len(blocks):
+                if i + 2 < len(blocks):
+                    mid = blocks[i + 1]
+                    mid_words = len(mid["text"].split())
+                    same_outer = blocks[i]["type"] == blocks[i + 2]["type"]
+                    if same_outer and mid_words < 8:
+                        blocks[i]["text"] += " " + mid["text"] + " " + blocks[i + 2]["text"]
+                        blocks[i]["end"] = blocks[i + 2]["end"]
+                        merged.append(blocks[i])
+                        i += 3
+                        changed = True
+                        continue
+                merged.append(blocks[i])
+                i += 1
+            blocks = merged
+
+        # Renumber
+        q_num = 0
+        for block in blocks:
+            if block["type"] == "question":
+                q_num += 1
+                block["number"] = q_num
+            else:
+                block["number"] = q_num
+
         for block in blocks:
             block["text"] = self.clean_text(block["text"])
 
@@ -363,9 +555,182 @@ class Transcriber:
         merged = self.merge_segments(raw)
         console.print(f" → {len(merged)} merged", end="")
 
-        self.detect_speakers(merged)
-        blocks = self.structure(merged)
-        console.print(f" → {len(blocks)} Q&A blocks")
+        if self.guide_questions:
+            blocks = self.structure_with_guide(merged)
+            console.print(f" → {len(blocks)} Q&A blocks (guide-anchored)")
+        else:
+            self.detect_speakers(merged)
+            blocks = self.structure(merged)
+            console.print(f" → {len(blocks)} Q&A blocks (pause-detected)")
+        return blocks
+
+    def structure_with_guide(self, segments: list[Segment]) -> list[dict]:
+        """
+        Use the interview guide to find Q/A boundaries via fuzzy matching.
+
+        Strategy: for each guide question, extract key phrases and search
+        segment-by-segment. Interviewers often rephrase, so we match on
+        distinctive keywords rather than requiring exact sequences.
+        """
+        if not segments or not self.guide_questions:
+            return []
+
+        from rich.console import Console
+        console = Console()
+
+        def extract_keywords(text: str) -> set[str]:
+            """Extract meaningful words (skip common Swedish/English stopwords)."""
+            stops = {
+                "och", "i", "på", "av", "en", "ett", "den", "det", "de", "som",
+                "är", "var", "att", "till", "med", "för", "om", "kan", "har",
+                "du", "dig", "din", "ditt", "dina", "vi", "jag", "så", "lite",
+                "nu", "då", "ju", "hur", "vad", "när", "sig", "inte", "skulle",
+                "the", "a", "an", "is", "are", "and", "or", "of", "to", "in",
+                "you", "your", "do", "does", "can", "could", "would", "that",
+                "this", "it", "be", "been", "have", "has", "was", "were",
+            }
+            words = re.findall(r'\w+', text.lower())
+            return {w for w in words if len(w) > 2 and w not in stops}
+
+        def match_score(guide_text: str, segment_text: str) -> float:
+            """Score how well a segment matches a guide question."""
+            guide_kw = extract_keywords(guide_text)
+            seg_kw = extract_keywords(segment_text)
+
+            if not guide_kw:
+                return 0.0
+
+            # Keyword overlap
+            overlap = guide_kw & seg_kw
+            kw_score = len(overlap) / len(guide_kw) if guide_kw else 0.0
+
+            # Also check sequence similarity on first N words
+            guide_start = " ".join(guide_text.lower().split()[:8])
+            seg_start = " ".join(segment_text.lower().split()[:8])
+            seq_score = SequenceMatcher(None, guide_start, seg_start).ratio()
+
+            # Check if any distinctive multi-word phrases match
+            guide_lower = guide_text.lower()
+            seg_lower = segment_text.lower()
+            phrase_bonus = 0.0
+
+            # Extract 3-word phrases from guide
+            guide_words = guide_lower.split()
+            for j in range(len(guide_words) - 2):
+                phrase = " ".join(guide_words[j:j+3])
+                if phrase in seg_lower:
+                    phrase_bonus = 0.3
+                    break
+
+            return max(kw_score, seq_score) + phrase_bonus
+
+        def match_score_window(guide_text: str, seg_idx: int, window: int = 3) -> tuple[float, int, int]:
+            """
+            Try matching guide question against segments[seg_idx:seg_idx+window].
+            Returns (best_score, start_seg, end_seg_exclusive).
+            The question might span 1-3 segments.
+            """
+            best = 0.0
+            best_range = (seg_idx, seg_idx + 1)
+
+            for size in range(1, min(window + 1, len(segments) - seg_idx + 1)):
+                combined = " ".join(segments[j].text for j in range(seg_idx, seg_idx + size))
+                score = match_score(guide_text, combined)
+                if score > best:
+                    best = score
+                    best_range = (seg_idx, seg_idx + size)
+
+            return best, best_range[0], best_range[1]
+
+        # Match each guide question to segments, searching forward only
+        matches = []  # (guide_idx, seg_start, seg_end, score)
+        search_from = 0
+
+        for gi, gq in enumerate(self.guide_questions):
+            best_score = 0.0
+            best_start = -1
+            best_end = -1
+
+            # Search from current position forward
+            for si in range(search_from, len(segments)):
+                score, s_start, s_end = match_score_window(gq["text"], si)
+
+                if score > best_score:
+                    best_score = score
+                    best_start = s_start
+                    best_end = s_end
+
+                # If we found a very good match, stop searching
+                if best_score >= 0.6:
+                    # But check a few more to be sure
+                    for si2 in range(si + 1, min(si + 5, len(segments))):
+                        score2, s2_start, s2_end = match_score_window(gq["text"], si2)
+                        if score2 > best_score:
+                            best_score = score2
+                            best_start = s2_start
+                            best_end = s2_end
+                    break
+
+            threshold = 0.25
+            if best_score >= threshold and best_start >= 0:
+                matches.append((gi, best_start, best_end, best_score))
+                search_from = best_end
+                console.print(
+                    f"    [dim]Guide Q{gi+1}: seg {best_start}-{best_end-1} "
+                    f"(score: {best_score:.2f}) "
+                    f"\"{segments[best_start].text[:60]}...\"[/dim]"
+                )
+            else:
+                console.print(f"    [dim]Guide Q{gi+1}: no match (best: {best_score:.2f})[/dim]")
+
+        if not matches:
+            console.print("  [yellow]No guide matches — falling back to pause detection[/yellow]")
+            self.detect_speakers(segments)
+            return self.structure(segments)
+
+        console.print(f"  [green]Matched {len(matches)}/{len(self.guide_questions)} guide questions[/green]")
+
+        # Build Q&A blocks
+        blocks = []
+
+        # Handle any content before the first matched question
+        if matches[0][1] > 0:
+            pre_text = " ".join(segments[j].text for j in range(0, matches[0][1]))
+            if pre_text.strip():
+                blocks.append({
+                    "type": "answer", "number": 0,
+                    "text": self.clean_text(pre_text),
+                    "start": segments[0].start,
+                    "end": segments[matches[0][1] - 1].end,
+                })
+
+        for mi, (gi, q_start, q_end, score) in enumerate(matches):
+            # Next question starts at...
+            if mi + 1 < len(matches):
+                next_q_start = matches[mi + 1][1]
+            else:
+                next_q_start = len(segments)
+
+            # Question text
+            q_text = " ".join(segments[j].text for j in range(q_start, q_end))
+            blocks.append({
+                "type": "question", "number": mi + 1,
+                "text": self.clean_text(q_text),
+                "start": segments[q_start].start,
+                "end": segments[q_end - 1].end,
+                "guide_question": self.guide_questions[gi]["text"],
+            })
+
+            # Answer = everything from q_end to next question
+            if q_end < next_q_start:
+                a_text = " ".join(segments[j].text for j in range(q_end, next_q_start))
+                blocks.append({
+                    "type": "answer", "number": mi + 1,
+                    "text": self.clean_text(a_text),
+                    "start": segments[q_end].start,
+                    "end": segments[next_q_start - 1].end,
+                })
+
         return blocks
 
 
@@ -381,66 +746,48 @@ def fmt_ts(seconds: float) -> str:
 
 def save_docx(blocks: list[dict], path: str, source: str, guide: list[dict] = None):
     from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, Cm
+
+    FONT = "Calibri"
+    SIZE = Pt(11)
+
+    def add(doc, text, bold=False, spacing_after=2):
+        p = doc.add_paragraph()
+        p.space_before = Pt(0)
+        p.space_after = Pt(spacing_after)
+        p.paragraph_format.line_spacing = 1.15
+        run = p.add_run(text)
+        run.font.name = FONT
+        run.font.size = SIZE
+        run.bold = bold
+        return p
 
     doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = FONT
+    style.font.size = SIZE
     for margin in ("top_margin", "bottom_margin", "left_margin", "right_margin"):
         setattr(doc.sections[0], margin, Cm(2.5))
 
-    title = doc.add_heading("Interview Transcript", level=0)
-    title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    add(doc, f"Interview Transcript — {source}", bold=True, spacing_after=4)
+    add(doc, f"Transcribed: {datetime.now().strftime('%Y-%m-%d %H:%M')}", spacing_after=8)
 
-    meta = doc.add_paragraph()
-    meta_lines = [f"Source: {source}", f"Transcribed: {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
     if guide:
-        meta_lines.append(f"Interview guide: {len(guide)} questions")
-    for line in meta_lines:
-        run = meta.add_run(line + "\n")
-        run.font.size = Pt(10)
-        run.font.color.rgb = RGBColor(100, 100, 100)
+        add(doc, "─" * 55)
+        add(doc, "INTERVIEW GUIDE REFERENCE", bold=True, spacing_after=4)
+        for q in guide:
+            add(doc, f"  {q['number']}. {q['text']}")
+        add(doc, "─" * 55, spacing_after=8)
 
-    doc.add_paragraph()
-    sep = doc.add_paragraph()
-    r = sep.add_run("─" * 60)
-    r.font.color.rgb = RGBColor(180, 180, 180)
-    r.font.size = Pt(8)
-    doc.add_paragraph()
+    add(doc, "TRANSCRIPT", bold=True, spacing_after=8)
 
     for block in blocks:
         is_q = block["type"] == "question"
         label = f"{'Q' if is_q else 'A'}{block['number']}"
-        color = RGBColor(30, 60, 120) if is_q else RGBColor(40, 100, 40)
+        ts = fmt_ts(block["start"])
 
-        header = doc.add_paragraph()
-        header.space_before = Pt(18 if is_q else 4)
-        header.space_after = Pt(4 if is_q else 2)
-
-        lr = header.add_run(label)
-        lr.bold = True
-        lr.font.size = Pt(12 if is_q else 11)
-        lr.font.color.rgb = color
-
-        ts = header.add_run(f"  [{fmt_ts(block['start'])}]")
-        ts.font.size = Pt(9)
-        ts.font.color.rgb = RGBColor(150, 150, 150)
-
-        if is_q and "guide_question" in block:
-            gp = doc.add_paragraph()
-            gp.space_before = Pt(0)
-            gp.space_after = Pt(2)
-            gr = gp.add_run(f"Guide: {block['guide_question']}")
-            gr.font.size = Pt(9)
-            gr.font.italic = True
-            gr.font.color.rgb = RGBColor(130, 130, 130)
-
-        body = doc.add_paragraph()
-        body.space_before = Pt(2)
-        body.space_after = Pt(6 if is_q else 12)
-        br = body.add_run(block["text"])
-        br.font.size = Pt(11)
-        if is_q:
-            br.bold = True
+        add(doc, f"{label} [{ts}]:", bold=True, spacing_after=2)
+        add(doc, block["text"], spacing_after=8 if not is_q else 2)
 
     doc.save(path)
 
