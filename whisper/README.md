@@ -21,8 +21,8 @@ Built for processing one-on-one interviews where clean, readable output matters.
 ## Installation
 
 ```bash
-git clone https://github.com/ChristofferNL/interview-transcriber.git
-cd interview-transcriber
+git clone https://github.com/Chrislundh98/DevOps-Media-Stack.git
+cd DevOps-Media-Stack/whisper
 pip install -r requirements.txt
 ```
 
