@@ -42,6 +42,80 @@ class TorrentMatcher:
         
         return sizes_match, size_diff_mb, size_diff_percent
     
+    # ---- SAFETY VETOES ----
+    
+    def _check_season_veto(self, tracker_meta, qbit_meta):
+        """Hard veto if seasons don't match. Returns True if vetoed."""
+        t_season = tracker_meta.get('season')
+        q_season = qbit_meta.get('season')
+        
+        if not t_season or not q_season:
+            return False
+        
+        # Complete packs can match any season within their range
+        if tracker_meta.get('is_complete_pack'):
+            season_end = tracker_meta.get('season_end')
+            if season_end:
+                try:
+                    if int(t_season) <= int(q_season) <= int(season_end):
+                        return False
+                except ValueError:
+                    pass
+            return False  # Complete pack, be lenient
+        
+        if qbit_meta.get('is_complete_pack'):
+            return False
+        
+        if t_season != q_season:
+            logger.debug(f"Season veto: tracker S{t_season} vs qbit S{q_season}")
+            return True
+        
+        return False
+    
+    def _check_release_group_veto(self, tracker_meta, qbit_meta):
+        """Hard veto if release groups clearly differ. Returns True if vetoed."""
+        t_group = tracker_meta.get('release_group')
+        q_group = qbit_meta.get('release_group')
+        
+        if not t_group or not q_group:
+            return False
+        
+        if t_group == q_group:
+            return False
+        
+        # Allow close matches (e.g. flux vs flux2)
+        if t_group.startswith(q_group) or q_group.startswith(t_group):
+            return False
+        
+        logger.debug(f"Release group veto: '{t_group}' vs '{q_group}'")
+        return True
+    
+    def _check_year_veto(self, tracker_meta, qbit_meta):
+        """Hard veto if years differ (prevents sequel confusion). Returns True if vetoed."""
+        t_year = tracker_meta.get('year')
+        q_year = qbit_meta.get('year')
+        
+        if not t_year or not q_year:
+            return False
+        
+        if t_year != q_year:
+            logger.debug(f"Year veto: {t_year} vs {q_year}")
+            return True
+        
+        return False
+    
+    def _all_vetoes_pass(self, tracker_meta, qbit_meta):
+        """Run all safety vetoes. Returns True if all pass (no vetoes triggered)."""
+        if self._check_season_veto(tracker_meta, qbit_meta):
+            return False
+        if self._check_release_group_veto(tracker_meta, qbit_meta):
+            return False
+        if self._check_year_veto(tracker_meta, qbit_meta):
+            return False
+        return True
+    
+    # ---- SCORING ----
+    
     def fuzzy_ratio(self, terms1, terms2):
         if not terms1 or not terms2:
             return 0.0
@@ -119,9 +193,50 @@ class TorrentMatcher:
         
         return matched / len(short_terms) if short_terms else 0.0
     
+    def _strong_evidence_check(self, tracker_tokens, qbit_tokens, tracker_meta, qbit_meta, size_match):
+        """
+        Check for strong evidence that two torrents are the same despite low fuzzy score.
+        Handles cases like generic qBit folder names ("Hot Ones" matching "Hot Ones S23 ...").
+        Returns a boost value (0.0 to 0.3).
+        """
+        boost = 0.0
+        
+        if not tracker_tokens or not qbit_tokens:
+            return 0.0
+        
+        qbit_set = set(qbit_tokens)
+        tracker_set = set(tracker_tokens)
+        
+        if len(qbit_set) == 0:
+            return 0.0
+        
+        overlap = qbit_set & tracker_set
+        overlap_ratio = len(overlap) / len(qbit_set)
+        
+        # If qbit tokens are a subset of tracker tokens (common with generic folder names)
+        if overlap_ratio >= 0.8 and len(overlap) >= 2:
+            boost += 0.15
+            if size_match:
+                boost += 0.10
+        
+        # AKA variant matching
+        tracker_aka = tracker_meta.get('aka_variants', [])
+        if tracker_aka:
+            for aka in tracker_aka:
+                aka_tokens = NameNormalizer.extract_tokens(aka, tracker_meta.get('tracker_tag', 'TL'))
+                aka_overlap = set(aka_tokens) & qbit_set
+                if len(aka_overlap) >= 2:
+                    boost += 0.15
+                    break
+        
+        return min(0.30, boost)
+    
+    # ---- MAIN MATCHING ----
+    
     def find_best_match(self, tracker_name, qbit_torrents, tracker_tag="TL", tracker_size_mb=None):
         norm_tracker = self.normalizer.normalize(tracker_name, tracker_tag)
         tracker_tokens = self.normalizer.extract_tokens(tracker_name, tracker_tag)
+        _, tracker_meta = self.normalizer.normalize(tracker_name, tracker_tag, return_metadata=True)
         
         if not tracker_tokens:
             logger.warning(f"No tokens extracted from tracker name: {tracker_name}")
@@ -130,14 +245,28 @@ class TorrentMatcher:
         best_match = None
         best_score = 0
         best_method = None
+        best_evidence_boost = 0
+        best_size_match = False
         
         candidates = []
         
         for qbit_torrent in qbit_torrents:
             qbit_name = qbit_torrent.name
             norm_qbit = self.normalizer.normalize(qbit_name, tracker_tag)
+            _, qbit_meta = self.normalizer.normalize(qbit_name, tracker_tag, return_metadata=True)
             
+            # --- EXACT MATCH (still check vetoes) ---
             if norm_tracker == norm_qbit:
+                if self._check_release_group_veto(tracker_meta, qbit_meta):
+                    logger.info(f"Exact match vetoed by release group: {tracker_name} vs {qbit_name}")
+                    continue
+                if self._check_season_veto(tracker_meta, qbit_meta):
+                    logger.info(f"Exact match vetoed by season: {tracker_name} vs {qbit_name}")
+                    continue
+                if self._check_year_veto(tracker_meta, qbit_meta):
+                    logger.info(f"Exact match vetoed by year: {tracker_name} vs {qbit_name}")
+                    continue
+                
                 match_data = {
                     'tracker_name': tracker_name,
                     'qbit_name': qbit_name,
@@ -149,10 +278,16 @@ class TorrentMatcher:
                     self.training_manager.add_match_attempt(match_data)
                 return qbit_torrent, 1.0, 'exact'
             
-            qbit_tokens = self.normalizer.extract_tokens(qbit_name, tracker_tag)
+            # --- SAFETY VETOES ---
+            if not self._all_vetoes_pass(tracker_meta, qbit_meta):
+                continue
             
+            # --- FUZZY SCORING ---
+            qbit_tokens = self.normalizer.extract_tokens(qbit_name, tracker_tag)
             fuzzy_score = self.fuzzy_ratio(tracker_tokens, qbit_tokens)
             
+            # Size validation
+            size_match = False
             if tracker_size_mb and hasattr(qbit_torrent, 'size'):
                 qbit_size_mb = qbit_torrent.size / (1024 * 1024)
                 size_match, size_diff, _ = self.compare_sizes(tracker_size_mb, qbit_size_mb)
@@ -160,18 +295,33 @@ class TorrentMatcher:
                 if size_match:
                     fuzzy_score *= 1.1
             
+            # Strong evidence boost (helps with generic folder names like "Hot Ones")
+            evidence_boost = self._strong_evidence_check(
+                tracker_tokens, qbit_tokens, tracker_meta, qbit_meta, size_match
+            )
+            fuzzy_score += evidence_boost
+            
             candidates.append({
                 'torrent': qbit_torrent,
                 'score': fuzzy_score,
-                'method': 'fuzzy'
+                'method': 'fuzzy',
+                'size_match': size_match,
+                'evidence_boost': evidence_boost
             })
             
             if fuzzy_score > best_score:
                 best_score = fuzzy_score
                 best_match = qbit_torrent
                 best_method = 'fuzzy'
+                best_evidence_boost = evidence_boost
+                best_size_match = size_match
         
-        if best_score >= self.match_threshold:
+        # Dynamic threshold: lower when strong evidence + size match
+        effective_threshold = self.match_threshold
+        if best_evidence_boost >= 0.15 and best_size_match:
+            effective_threshold = 0.60
+        
+        if best_score >= effective_threshold:
             match_data = {
                 'tracker_name': tracker_name,
                 'qbit_name': best_match.name,
@@ -184,11 +334,17 @@ class TorrentMatcher:
                 self.training_manager.add_match_attempt(match_data)
             return best_match, best_score, best_method
         
+        # --- SUBSTRING FALLBACK (with vetoes) ---
         for qbit_torrent in qbit_torrents:
-            qbit_tokens = self.normalizer.extract_tokens(qbit_torrent.name, tracker_tag)
-            substring_score = self.substring_score(tracker_tokens, qbit_tokens)
+            _, qbit_meta = self.normalizer.normalize(qbit_torrent.name, tracker_tag, return_metadata=True)
             
-            if substring_score >= 0.8:
+            if not self._all_vetoes_pass(tracker_meta, qbit_meta):
+                continue
+            
+            qbit_tokens = self.normalizer.extract_tokens(qbit_torrent.name, tracker_tag)
+            sub_score = self.substring_score(tracker_tokens, qbit_tokens)
+            
+            if sub_score >= 0.8:
                 if tracker_size_mb and hasattr(qbit_torrent, 'size'):
                     qbit_size_mb = qbit_torrent.size / (1024 * 1024)
                     size_match, _, _ = self.compare_sizes(tracker_size_mb, qbit_size_mb)
@@ -198,13 +354,14 @@ class TorrentMatcher:
                             'tracker_name': tracker_name,
                             'qbit_name': qbit_torrent.name,
                             'match_method': 'substring',
-                            'match_score': substring_score,
+                            'match_score': sub_score,
                             'success': True
                         }
                         if self.training_manager:
                             self.training_manager.add_match_attempt(match_data)
-                        return qbit_torrent, substring_score, 'substring'
+                        return qbit_torrent, sub_score, 'substring'
         
+        # --- NO MATCH ---
         match_data = {
             'tracker_name': tracker_name,
             'qbit_name': None,

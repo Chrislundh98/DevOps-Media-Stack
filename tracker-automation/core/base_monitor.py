@@ -29,7 +29,11 @@ class BaseMonitor(ABC):
         self.webhook_url = os.getenv('DISCORD_TORRENT_HOOK')
         self.qbit = QbitClient()
 
-        training_file = self.storage_dir / f'matching_training_data_{tracker_name.lower()}.json'
+        # All training data goes to storage/json/training/
+        training_dir = self.storage_dir / 'training'
+        training_dir.mkdir(parents=True, exist_ok=True)
+        training_file = training_dir / f'matching_training_data_{tracker_name.lower()}.json'
+
         accuracy_file = self.storage_dir / 'accuracy_log.json'
         health_file = self.storage_dir / 'algorithm_health.json'
 
