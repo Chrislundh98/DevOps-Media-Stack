@@ -25,7 +25,7 @@ from typing import Optional
 
 MODEL_SIZE      = "large-v3"    # tiny, base, small, medium, large-v2, large-v3
 LANGUAGE        = "sv"          # ISO 639-1: sv, en, de, fr, es, etc.
-BEAM_SIZE       = 10             # Higher = more accurate, slower (1-10)
+BEAM_SIZE       = 5             # Higher = more accurate, slower (1-10) << CHANGE THIS VALUE FOR BETTER RESULT DEPENDENT ON YOUR HARDWARE
 PAUSE_THRESHOLD = 2.0           # Seconds of silence to detect speaker change
 
 # Context prompt — adjust for your language/interview style
