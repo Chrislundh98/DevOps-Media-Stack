@@ -63,6 +63,11 @@ Useful documentation such as commands, guides, patterns, and other useful server
 
 **Technologies:** Bash, Docker, Python, Git
 
+### [whisper/](./whisper/)
+Transcriber based on the Faster-Whisper model, runs on python and works on Win/Mac/Linux, if modern NVIDIA GPU is available it will select that, otherwise it will fallback to CPU which will work but will be slower.
+
+**Technologies:** Python, AI/ML
+
 ---
 
 ## Technical Skills
