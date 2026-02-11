@@ -43,7 +43,7 @@ Verify CUDA is working:
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-> **Note:** The first run downloads the Whisper large-v3 model (~3 GB). This is cached for subsequent runs.
+> **Note:** The first run downloads the Whisper large-v3 model (~3 GB). This is cached for subsequent runs which makes the other runs faster.
 
 ## Quick Start
 
