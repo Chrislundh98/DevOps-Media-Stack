@@ -46,6 +46,21 @@ services:
     networks:
       - automation
 
+  bandwidth-manager:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: bandwidth-manager
+    restart: unless-stopped
+    command: python -m lib.bandwidth_manager
+    volumes:
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+    env_file:
+      - ../../.env
+    networks:
+      - automation
+
 networks:
   automation:
     name: automation
