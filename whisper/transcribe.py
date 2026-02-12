@@ -5,7 +5,6 @@ Interview Transcription System
 Structured interview transcription using faster-whisper with automatic
 CUDA/CPU detection. Produces clean Q&A formatted output with timestamps,
 speaker detection, and optional interview guide matching.
-
 """
 
 import argparse
@@ -27,8 +26,8 @@ from typing import Optional
 
 MODEL_SIZE      = "large-v3"    # tiny, base, small, medium, large-v2, large-v3
 LANGUAGE        = "sv"          # ISO 639-1: sv, en, de, fr, es, etc.
-BEAM_SIZE       = 10             # Higher = more accurate, slower (1-10)
-PAUSE_THRESHOLD = 1.5           # Seconds of silence to detect speaker change
+BEAM_SIZE       = 5             # Higher = more accurate, slower (1-10)
+PAUSE_THRESHOLD = 2.0           # Seconds of silence to detect speaker change
 
 # Context prompt — adjust for your language/interview style
 INITIAL_PROMPT = (
@@ -362,186 +361,356 @@ class Transcriber:
                 text += '.'
         return text
 
-    def detect_speakers(self, segments: list[Segment]) -> list[Segment]:
+    def structure_by_flow(self, segments: list[Segment]) -> list[dict]:
         """
-        Two-pass speaker detection combining pause analysis with linguistic
-        content scoring. Designed for rapid Swedish interviews where pauses
-        between speakers can be very short.
+        Structure transcript into Q&A blocks using sentence-level analysis.
+
+        Language-agnostic algorithm — works for any language using "?":
+        1. Build timestamped sentence stream from Whisper segments
+        2. Remove Whisper hallucinations (repeated content)
+        3. Find question anchors: "?" sentences verified by audio gaps
+        4. Handle command-style first questions (no "?")
+        5. Build Q/A blocks, absorb short preambles
+        6. Validate: merge tiny blocks, fix misclassified content
         """
         if not segments:
             return []
 
-        question_starters = {
-            "hur", "vad", "var", "vem", "vilken", "vilka", "vilket", "varför",
-            "när", "kan", "skulle", "har", "är", "tycker", "anser", "upplever",
-            "berätta", "beskriv", "förklara", "om", "finns",
-            "how", "what", "where", "who", "which", "why", "when", "can",
-            "could", "would", "do", "does", "tell", "describe", "explain",
-        }
+        sentences = self._build_sentences(segments)
+        if not sentences:
+            return []
 
-        question_phrases = [
-            "berätta lite", "berätta om", "hur ser", "hur upplever",
-            "vad tycker", "vad tänker", "vad anser", "hur skulle",
-            "kan du", "skulle du", "hur har", "på vilket sätt",
-            "vad innebär", "vad känner", "hur skulle du",
-            "vilka digitala", "vilka egenskaper", "vad skulle",
-            "om du hade", "om vi tänker",
-            "tell me", "how do you", "what do you", "can you",
-        ]
+        sentences = self._dedup_sentences(sentences)
 
-        answer_indicators = [
-            "ja,", "ja ", "ja men", "absolut", "nej", "jo", "jag",
-            "det är", "det var", "det beror", "det handlar",
-            "vi har", "vi använder", "man får",
-            "yes", "no", "well", "i think", "i believe",
-        ]
-
-        def question_score(text: str) -> float:
-            t = text.lower().strip()
-            words = t.split()
-            if not words:
-                return 0.0
-
-            score = 0.0
-
-            if words[0] in question_starters:
-                score += 0.35
-            if t.endswith("?"):
-                score += 0.35
-            for phrase in question_phrases:
-                if phrase in t:
-                    score += 0.25
-                    break
-
-            if len(words) < 20:
-                score += 0.1
-            if len(words) > 50:
-                score -= 0.3
-
-            return max(0.0, min(1.0, score))
-
-        def answer_score(text: str) -> float:
-            t = text.lower().strip()
-            words = t.split()
-            if not words:
-                return 0.0
-
-            score = 0.0
-
-            for indicator in answer_indicators:
-                if t.startswith(indicator):
-                    score += 0.3
-                    break
-
-            if len(words) > 30:
-                score += 0.3
-            elif len(words) > 15:
-                score += 0.15
-
-            if "?" not in t and len(words) > 10:
-                score += 0.1
-
-            return max(0.0, min(1.0, score))
-
-        # Score all segments
-        q_scores = [question_score(seg.text) for seg in segments]
-        a_scores = [answer_score(seg.text) for seg in segments]
-        gaps = [0.0] + [segments[i].start - segments[i - 1].end for i in range(1, len(segments))]
-
-        # Assign speakers
-        for i, seg in enumerate(segments):
-            qs, ans = q_scores[i], a_scores[i]
-            gap = gaps[i]
-            has_pause = gap >= self.config.pause_for_turn_switch * 0.5
-
-            if i == 0:
-                seg.speaker = "interviewer" if qs > ans else ("respondent" if ans > qs else "interviewer")
+        # ── Phase 1: Find question anchors ────────────────────────
+        # A "?" sentence is a Q anchor if it's either:
+        #   - Substantial (>= 10 words) — real question regardless of gap
+        #   - Short but preceded by an audio gap (>= 0.4s) — speaker changed
+        # Short "?" sentences with NO gap are likely rhetorical or quotes.
+        gap_threshold = self.config.pause_for_turn_switch * 0.25
+        q_anchors = []
+        for i, s in enumerate(sentences):
+            if "?" not in s["text"]:
                 continue
+            wc = len(s["text"].split())
+            if wc < 4:
+                continue
+            gap = s["start"] - sentences[i - 1]["end"] if i > 0 else 999.0
+            if wc >= 10 or gap >= gap_threshold:
+                q_anchors.append(i)
 
-            prev_speaker = segments[i - 1].speaker
+        if not q_anchors:
+            full = " ".join(s["text"] for s in sentences)
+            return [{"type": "answer", "number": 0,
+                     "text": self.clean_text(full),
+                     "start": sentences[0]["start"],
+                     "end": sentences[-1]["end"]}]
 
-            if has_pause:
-                if qs >= 0.3 and qs > ans:
-                    seg.speaker = "interviewer"
-                elif ans >= 0.3 and ans > qs:
-                    seg.speaker = "respondent"
-                elif gap >= self.config.pause_for_turn_switch:
-                    seg.speaker = "respondent" if prev_speaker == "interviewer" else "interviewer"
-                else:
-                    seg.speaker = prev_speaker
-            else:
-                seg.speaker = prev_speaker
+        # ── Phase 2: Group nearby anchors (same interviewer turn) ──
+        # Two ? anchors belong in the same group ONLY IF:
+        #   - They're within 3 sentences of each other AND
+        #   - The content between them is short (< 20 words)
+        # This prevents grouping Q-A-Q patterns where a short answer
+        # sneaks in between two ? sentences.
+        q_groups = []
+        for idx in q_anchors:
+            if q_groups:
+                prev_idx = q_groups[-1][-1]
+                gap = idx - prev_idx
+                if gap <= 3:
+                    between_words = sum(
+                        len(sentences[j]["text"].split())
+                        for j in range(prev_idx + 1, idx)
+                        if "?" not in sentences[j]["text"]
+                    )
+                    if between_words < 20:
+                        q_groups[-1].append(idx)
+                        continue
+            q_groups.append([idx])
 
-        return segments
+        # ── Phase 3: Absorb preambles ─────────────────────────────
+        # Look backward from each Q group's first sentence.
+        # Absorb preceding sentence ONLY IF:
+        #   - It's short (< 22 words, no "?")
+        #   - There's a gap before IT (suggesting speaker change happened there)
+        #   - Max 3 sentences / 50 words of preamble
+        q_regions = []  # (start_idx, end_idx) inclusive
+        for gi, group in enumerate(q_groups):
+            q_end = group[-1]
+            backward_limit = (q_regions[-1][1] + 1) if q_regions else 0
+            q_start = group[0]
+            preamble_words = 0
 
-    def structure(self, segments: list[Segment]) -> list[dict]:
-        if not segments:
-            return []
+            for i in range(group[0] - 1, max(backward_limit - 1, -1), -1):
+                wc = len(sentences[i]["text"].split())
+                if wc > 22:
+                    break  # too long — answer content
+                if preamble_words + wc > 50:
+                    break  # accumulated too much preamble
+                # Check for gap before this sentence (speaker change signal)
+                gap = sentences[i]["start"] - sentences[i - 1]["end"] if i > 0 else 999.0
+                if gap < gap_threshold and i != 0:
+                    break  # no gap = same speaker = still answer content
+                q_start = i
+                preamble_words += wc
+                if group[0] - i >= 3:
+                    break  # max 3 sentences of preamble
 
+            q_regions.append((q_start, q_end))
+
+        # ── Phase 4: First-block handling ─────────────────────────
+        # If the transcript starts before the first Q anchor, detect
+        # command-style questions ("Tell me about yourself." / no "?")
+        first_q = q_regions[0][0]
+        cmd_q_end = None
+
+        if first_q >= 2:
+            # First 1-3 short sentences could be a command question.
+            # Answer starts where content becomes factual/long.
+            q_word_total = 0
+            for i in range(min(first_q, 4)):
+                wc = len(sentences[i]["text"].split())
+                if wc > 30:
+                    break
+                q_word_total += wc
+                # Check: does the NEXT sentence look like answer content?
+                if q_word_total >= 5 and i + 1 < first_q:
+                    next_text = sentences[i + 1]["text"]
+                    next_wc = len(next_text.split())
+                    # Answer signals: starts with digit, or is a long
+                    # declarative sentence (> 20 words, no "?")
+                    is_digit = bool(re.match(r'\d', next_text))
+                    is_long_decl = next_wc > 20 and "?" not in next_text
+                    if is_digit or is_long_decl:
+                        cmd_q_end = i + 1
+                        break
+
+        # ── Phase 5: Build blocks ─────────────────────────────────
         blocks = []
-        q_count = 0
-        current = None
+        q_num = 0
 
+        # First block (command Q or pre-Q content)
+        if cmd_q_end is not None:
+            q_num += 1
+            q_text = " ".join(sentences[i]["text"] for i in range(cmd_q_end))
+            blocks.append({
+                "type": "question", "number": q_num,
+                "text": self.clean_text(q_text),
+                "start": sentences[0]["start"],
+                "end": sentences[cmd_q_end - 1]["end"],
+            })
+            if cmd_q_end < first_q:
+                a_text = " ".join(
+                    sentences[i]["text"] for i in range(cmd_q_end, first_q)
+                )
+                if a_text.strip():
+                    blocks.append({
+                        "type": "answer", "number": q_num,
+                        "text": self.clean_text(a_text),
+                        "start": sentences[cmd_q_end]["start"],
+                        "end": sentences[first_q - 1]["end"],
+                    })
+        elif first_q > 0:
+            # No command Q detected — dump as A0
+            a_text = " ".join(sentences[i]["text"] for i in range(first_q))
+            if a_text.strip():
+                blocks.append({
+                    "type": "answer", "number": 0,
+                    "text": self.clean_text(a_text),
+                    "start": sentences[0]["start"],
+                    "end": sentences[first_q - 1]["end"],
+                })
+
+        # Main Q/A blocks
+        for gi, (q_start, q_end) in enumerate(q_regions):
+            q_num += 1
+            q_text = " ".join(
+                sentences[i]["text"] for i in range(q_start, q_end + 1)
+            )
+            blocks.append({
+                "type": "question", "number": q_num,
+                "text": self.clean_text(q_text),
+                "start": sentences[q_start]["start"],
+                "end": sentences[q_end]["end"],
+            })
+
+            a_start = q_end + 1
+            a_end = q_regions[gi + 1][0] if gi + 1 < len(q_regions) else len(sentences)
+            if a_start < a_end:
+                a_text = " ".join(
+                    sentences[i]["text"] for i in range(a_start, a_end)
+                )
+                if a_text.strip():
+                    blocks.append({
+                        "type": "answer", "number": q_num,
+                        "text": self.clean_text(a_text),
+                        "start": sentences[a_start]["start"],
+                        "end": sentences[a_end - 1]["end"],
+                    })
+
+        # ── Phase 6: Validate ─────────────────────────────────────
+        blocks = self._validate_blocks(blocks)
+
+        # Renumber
+        q_num = 0
+        for b in blocks:
+            if b["type"] == "question":
+                q_num += 1
+            b["number"] = q_num
+
+        if self.guide_questions:
+            idx = 0
+            for b in blocks:
+                if b["type"] == "question" and idx < len(self.guide_questions):
+                    b["guide_question"] = self.guide_questions[idx]["text"]
+                    idx += 1
+
+        return blocks
+
+    # ── Helpers ────────────────────────────────────────────────────
+
+    def _build_sentences(self, segments: list[Segment]) -> list[dict]:
+        """Split Whisper segments into individual timestamped sentences."""
+        sentences = []
         for seg in segments:
-            btype = "question" if seg.speaker == "interviewer" else "answer"
-            if current is None or btype != current["type"]:
-                if current:
-                    blocks.append(current)
-                if btype == "question":
-                    q_count += 1
-                current = {
-                    "type": btype, "number": q_count,
-                    "text": seg.text, "start": seg.start, "end": seg.end,
-                }
-            else:
-                current["text"] += " " + seg.text
-                current["end"] = seg.end
+            text = seg.text.strip()
+            if not text:
+                continue
+            parts = re.split(r'(?<=[.!?])\s+', text)
+            total_chars = sum(len(p) for p in parts) or 1
+            duration = seg.end - seg.start
+            offset = seg.start
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                d = (len(part) / total_chars) * duration
+                sentences.append({
+                    "text": part, "start": offset, "end": offset + d,
+                    "seg_start": seg.start,
+                })
+                offset += d
+        return sentences
 
-        if current:
-            blocks.append(current)
+    def _dedup_sentences(self, sentences: list[dict]) -> list[dict]:
+        """Remove Whisper hallucinations (repeated content).
 
-        # Post-process pass 1: merge short false-positive blocks back.
-        # Pattern: Q-A-Q where A has < 8 words → merge all into Q
-        # Pattern: A-Q-A where Q has < 8 words → merge all into A
+        Uses a sliding window to catch interleaved repeats, not just
+        consecutive duplicates. Whisper sometimes repeats entire Q+A
+        blocks like: [Q1][A1][Q1][A1][Q1]...
+        """
+        if len(sentences) < 2:
+            return sentences
+        window_size = 10
+        result = [sentences[0]]
+        for s in sentences[1:]:
+            curr_w = set(s["text"].lower().split())
+            if len(curr_w) <= 3:
+                result.append(s)
+                continue
+            is_dup = False
+            for prev in result[-window_size:]:
+                prev_w = set(prev["text"].lower().split())
+                if not prev_w:
+                    continue
+                overlap = len(prev_w & curr_w) / max(len(prev_w), len(curr_w))
+                if overlap > 0.65:
+                    sim = SequenceMatcher(
+                        None, prev["text"].lower(), s["text"].lower()
+                    ).ratio()
+                    if sim > 0.55:
+                        is_dup = True
+                        break
+            if not is_dup:
+                result.append(s)
+        return result
+
+    def _validate_blocks(self, blocks: list[dict]) -> list[dict]:
+        """
+        Post-validation to fix structural errors.
+
+        Rules:
+        1. Q block > 50 words without "?" → reclassify as answer
+        2. Q-A-Q where A < 12 words → merge (false split)
+        3. Short Q (< 12w) that creates a short preceding A (< 25w) →
+           likely rhetorical, merge back into answer
+        4. Adjacent same-type blocks → merge
+        """
+        if not blocks:
+            return blocks
+
+        # Rule 1: Long Q without ? = misclassified answer
+        for b in blocks:
+            if b["type"] == "question" and "?" not in b["text"]:
+                if len(b["text"].split()) > 50:
+                    b["type"] = "answer"
+
+        # Rule 2: Tiny answer between two Qs
         changed = True
         while changed:
             changed = False
             merged = []
             i = 0
             while i < len(blocks):
-                if i + 2 < len(blocks):
-                    mid = blocks[i + 1]
-                    mid_words = len(mid["text"].split())
-                    same_outer = blocks[i]["type"] == blocks[i + 2]["type"]
-                    if same_outer and mid_words < 8:
-                        blocks[i]["text"] += " " + mid["text"] + " " + blocks[i + 2]["text"]
-                        blocks[i]["end"] = blocks[i + 2]["end"]
-                        merged.append(blocks[i])
-                        i += 3
-                        changed = True
-                        continue
-                merged.append(blocks[i])
-                i += 1
+                if (
+                    i + 2 < len(blocks)
+                    and blocks[i]["type"] == "question"
+                    and blocks[i + 1]["type"] == "answer"
+                    and blocks[i + 2]["type"] == "question"
+                    and len(blocks[i + 1]["text"].split()) < 12
+                ):
+                    blocks[i]["text"] += " " + blocks[i + 1]["text"] + " " + blocks[i + 2]["text"]
+                    blocks[i]["end"] = blocks[i + 2]["end"]
+                    merged.append(blocks[i])
+                    i += 3
+                    changed = True
+                else:
+                    merged.append(blocks[i])
+                    i += 1
             blocks = merged
 
-        # Renumber
-        q_num = 0
-        for block in blocks:
-            if block["type"] == "question":
-                q_num += 1
-                block["number"] = q_num
+        # Rule 3: Short Q creating a short preceding A → rhetorical
+        changed = True
+        while changed:
+            changed = False
+            merged = []
+            i = 0
+            while i < len(blocks):
+                if (
+                    i >= 1
+                    and blocks[i]["type"] == "question"
+                    and len(blocks[i]["text"].split()) < 12
+                    and blocks[i - 1]["type"] == "answer"
+                    and len(blocks[i - 1]["text"].split()) < 25
+                ):
+                    # This Q is probably rhetorical — merge it and
+                    # the short preceding A into the block before that
+                    if i + 1 < len(blocks) and blocks[i + 1]["type"] == "answer":
+                        # Merge: prev_A + this_Q + next_A → one big A
+                        merged[-1]["text"] += (" " + blocks[i]["text"]
+                                               + " " + blocks[i + 1]["text"])
+                        merged[-1]["end"] = blocks[i + 1]["end"]
+                        i += 2
+                        changed = True
+                    else:
+                        merged[-1]["text"] += " " + blocks[i]["text"]
+                        merged[-1]["end"] = blocks[i]["end"]
+                        i += 1
+                        changed = True
+                else:
+                    merged.append(blocks[i])
+                    i += 1
+            blocks = merged
+
+        # Rule 4: Merge adjacent same-type blocks
+        merged = [blocks[0]]
+        for b in blocks[1:]:
+            if b["type"] == merged[-1]["type"]:
+                merged[-1]["text"] += " " + b["text"]
+                merged[-1]["end"] = b["end"]
             else:
-                block["number"] = q_num
-
-        for block in blocks:
-            block["text"] = self.clean_text(block["text"])
-
-        if self.guide_questions:
-            idx = 0
-            for block in blocks:
-                if block["type"] == "question" and idx < len(self.guide_questions):
-                    block["guide_question"] = self.guide_questions[idx]["text"]
-                    idx += 1
+                merged.append(b)
+        blocks = merged
 
         return blocks
 
@@ -559,9 +728,8 @@ class Transcriber:
             blocks = self.structure_with_guide(merged)
             console.print(f" → {len(blocks)} Q&A blocks (guide-anchored)")
         else:
-            self.detect_speakers(merged)
-            blocks = self.structure(merged)
-            console.print(f" → {len(blocks)} Q&A blocks (pause-detected)")
+            blocks = self.structure_by_flow(merged)
+            console.print(f" → {len(blocks)} Q&A blocks (flow-detected)")
         return blocks
 
     def structure_with_guide(self, segments: list[Segment]) -> list[dict]:
@@ -684,9 +852,8 @@ class Transcriber:
                 console.print(f"    [dim]Guide Q{gi+1}: no match (best: {best_score:.2f})[/dim]")
 
         if not matches:
-            console.print("  [yellow]No guide matches — falling back to pause detection[/yellow]")
-            self.detect_speakers(segments)
-            return self.structure(segments)
+            console.print("  [yellow]No guide matches — falling back to flow detection[/yellow]")
+            return self.structure_by_flow(segments)
 
         console.print(f"  [green]Matched {len(matches)}/{len(self.guide_questions)} guide questions[/green]")
 
