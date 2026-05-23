@@ -10,10 +10,7 @@ import bencodepy
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.ui import Select
@@ -24,7 +21,7 @@ from qbittorrentapi import Client, APIConnectionError
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.base_monitor import BaseMonitor
-from lib import CloudflareBypass, CookieManager, TorrentMatcher
+from lib import CloudflareBypass, CookieManager, TorrentMatcher, create_chrome_driver
 
 # Selectors
 SHOW_TRANSFERS_BUTTON_SELECTOR = (By.XPATH, "//button[contains(@ng-click, 'togglePeers')]")
@@ -42,13 +39,12 @@ HNR_TORRENT_DOWNLOAD_LINK_SELECTOR = (By.XPATH, "//a[.//button[contains(text(), 
 HNR_PAGINATION_NEXT_DISABLED_SELECTOR = (By.XPATH, "//ul[contains(@class, 'pagination')]//li[contains(@class, 'pagination-next') and contains(@class, 'disabled')]")
 HNR_PAGINATION_NEXT_SELECTOR = (By.XPATH, "//ul[contains(@class, 'pagination')]//li[contains(@class, 'pagination-next') and not(contains(@class, 'disabled'))]//a")
 
-
 class DigitalCoreMonitor(BaseMonitor):
 
     DC_TRACKER_PATTERNS = ['trackerprxy.digitalcore.club', 'tracker.digitalcore.club']
     TL_TRACKER_PATTERNS = ['tracker.tleechreload.org', 'tracker.torrentleech.org']
 
-    HNR_DOWNLOAD_PATH = "/volume2/data/downloads/watch"
+    HNR_DOWNLOAD_PATH = "/mnt/storage/data/downloads/watch"
     HNR_CATEGORY = "manual"
     HNR_TAG = "DC"
 
@@ -64,46 +60,26 @@ class DigitalCoreMonitor(BaseMonitor):
         self.qbit_pass = os.getenv('QBIT_PASS')
 
         self.cookie_file = storage_dir / 'dc_cookie.json'
-        self.chrome_profile = base_dir / 'logs' / 'chrome_profiles' / 'dc_monitor'
-        self.chrome_driver_log = log_dir / 'chromedriver_dc_monitor.log'
+        self.chrome_profile = base_dir / 'storage' / 'chrome_profiles' / 'dc_monitor'
         self.debug_screenshot = log_dir / 'dc_debug_failure.png'
 
         self.chrome_profile.mkdir(parents=True, exist_ok=True)
 
         self.base_url = "https://digitalcore.club"
-        self.user_profile_url = "https://digitalcore.club/user/USER_ID/your-username"
+        self.user_id = os.getenv('DC_USER_ID')
+        self.user_handle = os.getenv('DC_USER_HANDLE')
+        self.user_profile_url = f"{self.base_url}/user/{self.user_id}/{self.user_handle}"
         self.hnr_url = "https://digitalcore.club/hnr"
         self.myseeds_url = "https://digitalcore.club/myseeds"
 
         self.session = requests.Session()
 
-    def _find_chrome_binary(self):
-        for path in ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome']:
-            if os.path.exists(path):
-                return path
-        return None
-
     def _init_driver(self):
-        chrome_options = Options()
-        chrome_binary = self._find_chrome_binary()
-        if chrome_binary:
-            chrome_options.binary_location = chrome_binary
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument(f"--user-data-dir={self.chrome_profile}")
-
-        logging.info("Installing/updating ChromeDriver via webdriver_manager...")
-        service = Service(
-            ChromeDriverManager().install(),
-            log_output=str(self.chrome_driver_log)
+        logging.info("Starting Chrome browser (undetected_chromedriver)...")
+        self.driver = create_chrome_driver(
+            profile_dir=self.chrome_profile,
+            page_load_timeout=120,
         )
-        logging.info("Starting Chrome browser...")
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        self.driver.set_page_load_timeout(120)
         logging.info("Chrome driver created successfully")
 
     def _login(self):
@@ -168,9 +144,7 @@ class DigitalCoreMonitor(BaseMonitor):
         for cookie in self.driver.get_cookies():
             self.session.cookies.set(cookie['name'], cookie['value'])
 
-    # ======================================================================
     # HNR FIXER
-    # ======================================================================
 
     def fix_hnr(self):
         logging.info("Checking for HnR warnings...")
@@ -262,9 +236,7 @@ class DigitalCoreMonitor(BaseMonitor):
             }]
             self._send_discord(embeds)
 
-    # ======================================================================
     # SCRAPING
-    # ======================================================================
 
     def scrape_seeding_torrents(self):
         logging.info("Scraping seeding torrents from DigitalCore...")
@@ -419,9 +391,7 @@ class DigitalCoreMonitor(BaseMonitor):
         logging.info(f"Total torrents scraped: {len(torrents)}")
         return torrents
 
-    # ======================================================================
     # REMOVAL RULES
-    # ======================================================================
 
     def apply_removal_rules(self, tracker_torrents):
         try:
@@ -499,9 +469,7 @@ class DigitalCoreMonitor(BaseMonitor):
         qbt_client.auth_log_out()
         return to_remove
 
-    # ======================================================================
     # MAIN RUN
-    # ======================================================================
 
     def run(self):
         logging.info("=" * 80)
@@ -581,7 +549,6 @@ class DigitalCoreMonitor(BaseMonitor):
         }]
 
         self._send_discord(embeds, username="DigitalCore Monitor")
-
 
 if __name__ == "__main__":
     monitor = DigitalCoreMonitor()

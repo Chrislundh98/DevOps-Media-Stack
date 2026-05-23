@@ -4,14 +4,12 @@ from datetime import datetime, timezone
 from typing import Optional
 import config
 
-
 class CoCAPIError(Exception):
     """Custom exception for CoC API errors"""
     def __init__(self, status: int, message: str):
         self.status = status
         self.message = message
         super().__init__(f"CoC API Error {status}: {message}")
-
 
 class CoCAPI:
     def __init__(self):
@@ -68,12 +66,10 @@ class CoCAPI:
         encoded = self._encode_tag(war_tag)
         return await self._request(f"/clanwarleagues/wars/{encoded}")
 
-
 def parse_coc_timestamp(timestamp: str) -> datetime:
     """Parse CoC API timestamp format (20240115T120000.000Z) to datetime"""
     # Format: YYYYMMDDTHHmmss.SSSZ
     return datetime.strptime(timestamp, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc)
-
 
 def format_time_remaining(end_time: datetime) -> str:
     """Format time remaining until end_time as human readable string"""

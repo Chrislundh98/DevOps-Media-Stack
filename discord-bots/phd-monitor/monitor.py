@@ -26,7 +26,6 @@ MONITORED_UNIVERSITIES = [
     "Jönköping University",
 ]
 
-
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -36,14 +35,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class UniversityStatus:
     """Represents the status of a university listing."""
     PLAINTEXT = "plaintext"      # No link yet - application not open
     LINK_ACTIVE = "link_active"  # Has link - application is open!
     FILLED = "filled"            # Position already filled
     NOT_FOUND = "not_found"      # University not found on page
-
 
 def load_state() -> dict:
     """Load previous state from file."""
@@ -55,13 +52,11 @@ def load_state() -> dict:
             logger.warning(f"Could not load state file: {e}")
     return {"universities": {}}
 
-
 def save_state(state: dict) -> None:
     """Save current state to file."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-
 
 def fetch_page() -> Optional[str]:
     """Fetch the Cybercampus page HTML."""
@@ -75,7 +70,6 @@ def fetch_page() -> Optional[str]:
     except requests.RequestException as e:
         logger.error(f"Failed to fetch page: {e}")
         return None
-
 
 def parse_university_status(html: str, university_name: str) -> tuple[str, Optional[str]]:
     """
@@ -105,7 +99,6 @@ def parse_university_status(html: str, university_name: str) -> tuple[str, Optio
             return UniversityStatus.PLAINTEXT, None
     
     return UniversityStatus.NOT_FOUND, None
-
 
 def send_discord_notification(
     university: str, 
@@ -173,7 +166,6 @@ def send_discord_notification(
         logger.error(f"Failed to send Discord notification: {e}")
         return False
 
-
 def check_universities() -> None:
     """Main check function - fetches page and checks all monitored universities."""
     logger.info("Starting check...")
@@ -217,11 +209,9 @@ def check_universities() -> None:
     save_state(state)
     logger.info("Check complete")
 
-
 def run_once() -> None:
     """Run a single check (for testing)."""
     check_universities()
-
 
 def run_loop() -> None:
     """Run continuous monitoring loop."""
@@ -240,7 +230,6 @@ def run_loop() -> None:
         
         logger.info(f"Next check in {CHECK_INTERVAL_SECONDS // 60} minutes...")
         time.sleep(CHECK_INTERVAL_SECONDS)
-
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--once":

@@ -5,8 +5,8 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-DOWNLOAD_PATH = "/volume2/data/downloads"
-EXTRACT_PATH = "/volume2/data/extracted"
+DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "/mnt/storage/data/downloads")
+EXTRACT_PATH = os.getenv("EXTRACT_PATH", "/mnt/storage/data/extracted")
 
 base_dir = Path(__file__).parent.parent.parent
 log_dir = base_dir / 'logs' / 'media'

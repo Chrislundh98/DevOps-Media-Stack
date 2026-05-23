@@ -1,3 +1,7 @@
+# Core stack — reverse proxy, VPN gateway, monitoring, container updates.
+# Shares an external network with the media stack so containers from both
+# stacks can resolve each other by name.
+
 networks:
   shared_network:
     name: shared_network
@@ -13,12 +17,16 @@ services:
       - '8443:443'
       - '81:81'
     volumes:
-      - /volume1/docker/appdata/nginxproxymanager/data:/data
-      - /volume1/docker/appdata/nginxproxymanager/letsencrypt:/etc/letsencrypt
+      - ${APPDATA}/nginxproxymanager/data:/data
+      - ${APPDATA}/nginxproxymanager/letsencrypt:/etc/letsencrypt
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       shared_network:
+        # Pinned IP — Jellyfin reverse-proxies through this address.
         ipv4_address: 172.18.0.12
 
+  # General-purpose WireGuard tunnel for clients (phones, laptops).
   wireguard:
     image: lscr.io/linuxserver/wireguard:latest
     container_name: wireguard
@@ -29,18 +37,23 @@ services:
     ports:
       - '51820:51820/udp'
     volumes:
-      - /volume1/docker/appdata/wireguard:/config
+      - ${APPDATA}/wireguard:/config
       - /lib/modules:/lib/modules
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - SERVERURL=${PUBLIC_IP}
       - PEERS=8
       - INTERNAL_SUBNET=10.13.13.0/24
+    labels:
+      # Pinned: excluded from watchtower so a bad image push can't break
+      # remote access while the host is unattended. Update manually.
+      - "com.centurylinklabs.watchtower.enable=false"
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
 
+  # Separate admin tunnel — full-tunnel, smaller peer set, isolated subnet.
   wireguard-admin:
     image: lscr.io/linuxserver/wireguard:latest
     container_name: wireguard-admin
@@ -51,18 +64,20 @@ services:
     ports:
       - '51821:51820/udp'
     volumes:
-      - /volume1/docker/appdata/wireguard-admin:/config
+      - ${APPDATA}/wireguard-admin:/config
       - /lib/modules:/lib/modules
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - SERVERURL=${PUBLIC_IP}
-      - SERVERPORT=51821  
+      - SERVERPORT=51821
       - PEERS=3
       - PEERDNS=auto
-      - INTERNAL_SUBNET=10.14.14.0/24 
+      - INTERNAL_SUBNET=10.14.14.0/24
       - ALLOWEDIPS=0.0.0.0/0
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
     networks:
@@ -79,23 +94,27 @@ services:
       - /:/host:ro
     environment:
       - GLANCES_OPT=-w
-  
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
   wizarr:
-    container_name: wizarr
     image: ghcr.io/wizarrrr/wizarr:latest
+    container_name: wizarr
     restart: unless-stopped
     ports:
       - "5690:5690"
     volumes:
-      - /volume1/docker/appdata/wizarr:/data
+      - ${APPDATA}/wizarr:/data
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - DISABLE_BUILTIN_AUTH=false
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
-    
+
   jellystat:
     image: cyfershepard/jellystat:latest
     container_name: jellystat
@@ -108,10 +127,12 @@ services:
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${JS_DB_NAME}
       - JWT_SECRET=${JS_JWT_SECRET}
-      - TZ=${JS_TZ}
+      - TZ=${TZ}
       - JF_USE_WEBSOCKETS=false
     ports:
       - "${JS_PORT}:3000"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
     depends_on:
@@ -127,6 +148,27 @@ services:
       - POSTGRES_PASSWORD=${JS_DB_PASSWORD}
       - POSTGRES_DB=${JS_DB_NAME}
     volumes:
-      - /volume1/docker/appdata/jellystat/db:/var/lib/postgresql/data
+      - ${APPDATA}/jellystat/db:/var/lib/postgresql/data
     networks:
       - shared_network
+    labels:
+      # Pinned: Postgres major-version bumps are not safe to auto-apply.
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=${TZ}
+      - DOCKER_API_VERSION=1.44
+      - WATCHTOWER_SCHEDULE=0 0 3 * * *
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      # Only updates containers that opted in via label — see compose files.
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_NOTIFICATION_URL=${DISCORD_WATCHTOWER}
+      - WATCHTOWER_NOTIFICATION_REPORT=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

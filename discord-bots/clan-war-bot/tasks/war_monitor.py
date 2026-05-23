@@ -12,7 +12,6 @@ from coc_api import CoCAPI, CoCAPIError, parse_coc_timestamp, format_time_remain
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
 
-
 # Reminder thresholds in hours
 REMINDER_THRESHOLDS = [8, 4, 2, 1]  # 8h, 4h, 2h, 1h
 
@@ -69,7 +68,6 @@ REMINDER_MESSAGES_ORES = [
     "{mentions} Free ores available. This isn't complicated.",
     "{mentions} War done, ores unclaimed. This is why we can't have nice things.",
 ]
-
 
 class WarMonitor:
     def __init__(self, bot: "Bot", coc_api: CoCAPI):
@@ -130,17 +128,75 @@ class WarMonitor:
         """Determine which day of CWL this war is"""
         rounds = league_group.get("rounds", [])
         war_start = war_data.get("startTime", "")
-        
+
         for i, round_data in enumerate(rounds):
             war_tags = round_data.get("warTags", [])
             for war_tag in war_tags:
-                # We need to match by checking the war
                 # Since we have the war_data, match by startTime
                 pass
-        
+
         # Fallback: count by start time ordering
         # Each CWL day is roughly 24 hours apart
         return len([r for r in rounds if r.get("warTags", ["#0"])[0] != "#0"])
+
+    async def get_cwl_day_war_data(self, league_group: dict, day_number: int) -> Optional[dict]:
+        """Fetch our clan's war data for a specific CWL day (1-indexed)."""
+        if day_number < 1:
+            return None
+
+        rounds = league_group.get("rounds", [])
+        if day_number > len(rounds):
+            return None
+
+        round_data = rounds[day_number - 1]
+        war_tags = round_data.get("warTags", [])
+
+        our_tag = config.CLAN_TAG.upper()
+        if not our_tag.startswith("#"):
+            our_tag = f"#{our_tag}"
+
+        for war_tag in war_tags:
+            if war_tag == "#0":
+                continue
+            try:
+                war_data = await self.coc.get_cwl_war(war_tag)
+                clan = war_data.get("clan", {})
+                opponent = war_data.get("opponent", {})
+                if clan.get("tag", "").upper() == our_tag or opponent.get("tag", "").upper() == our_tag:
+                    if opponent.get("tag", "").upper() == our_tag:
+                        war_data["clan"], war_data["opponent"] = war_data["opponent"], war_data["clan"]
+                    return war_data
+            except CoCAPIError:
+                continue
+
+        return None
+
+    def record_cwl_war_data(self, war_data: dict, cwl_day: int, season_id: str):
+        """Persist CWL day performance to the database. Idempotent."""
+        clan = war_data.get("clan", {})
+        opponent = war_data.get("opponent", {})
+        clan_members = clan.get("members", [])
+        opponent_tag = opponent.get("tag", "")
+
+        for member in clan_members:
+            attacks = member.get("attacks", [])
+            stars = sum(a.get("stars", 0) for a in attacks)
+            destruction = sum(a.get("destructionPercentage", 0) for a in attacks)
+            attack_used = 1 if attacks else 0
+
+            db.record_cwl_performance(
+                season_id=season_id,
+                day_number=cwl_day,
+                player_tag=member.get("tag"),
+                player_name=member.get("name"),
+                stars=stars,
+                destruction=destruction,
+                attack_used=attack_used,
+                in_roster=1,
+                opponent_tag=opponent_tag
+            )
+
+        db.update_cwl_day(season_id, cwl_day)
     
     async def get_current_war(self) -> tuple[Optional[dict], bool]:
         """
@@ -201,32 +257,32 @@ class WarMonitor:
         # Get all rounds
         rounds = league_group.get("rounds", [])
         
-        # Track best active war and any unannounced ended wars
+        # Track best active war and all unannounced ended wars
         best_active_war = None
         best_active_priority = -1  # inWar=2, preparation=1
-        unannounced_ended_war = None
-        
+        unannounced_ended_wars = []
+
         for round_data in rounds:
             war_tags = round_data.get("warTags", [])
-            
+
             for war_tag in war_tags:
                 if war_tag == "#0":  # Placeholder for wars not yet started
                     continue
-                
+
                 try:
                     war_data = await self.coc.get_cwl_war(war_tag)
-                    
+
                     # Check if our clan is in this war
                     clan = war_data.get("clan", {})
                     opponent = war_data.get("opponent", {})
-                    
+
                     if clan.get("tag", "").upper() == our_tag or opponent.get("tag", "").upper() == our_tag:
                         # Swap if we're the opponent
                         if opponent.get("tag", "").upper() == our_tag:
                             war_data["clan"], war_data["opponent"] = war_data["opponent"], war_data["clan"]
-                        
+
                         state = war_data.get("state")
-                        
+
                         if state == "inWar":
                             # Active war takes highest priority, return immediately
                             return war_data
@@ -235,20 +291,24 @@ class WarMonitor:
                                 best_active_war = war_data
                                 best_active_priority = 1
                         elif state == "warEnded":
-                            # Check if this ended war has been announced
                             war_id = self.generate_war_id(war_data)
                             if not db.has_war_end_been_announced(war_id):
-                                # Found an unannounced ended war - this takes priority!
-                                unannounced_ended_war = war_data
-                        
+                                unannounced_ended_wars.append(war_data)
+
                 except CoCAPIError:
                     continue
-        
-        # Return unannounced ended war first (so we can announce it)
-        # Otherwise return best active war
-        if unannounced_ended_war:
-            return unannounced_ended_war
-        
+
+        # If multiple unannounced ended wars exist (e.g. after a bot restart that
+        # cleared DB state), only announce the most recent one and silently mark
+        # the older ones as announced so they don't flood the channel.
+        if unannounced_ended_wars:
+            unannounced_ended_wars.sort(key=lambda w: w.get("endTime", ""))
+            for stale in unannounced_ended_wars[:-1]:
+                stale_id = self.generate_war_id(stale)
+                db.mark_war_end_announced(stale_id)
+                print(f"[WarMonitor] Silently marked stale CWL war as announced: {stale_id}")
+            return unannounced_ended_wars[-1]
+
         return best_active_war
     
     def get_members_with_remaining_attacks(self, war_data: dict, is_cwl: bool) -> list[dict]:
@@ -505,25 +565,123 @@ class WarMonitor:
             
             await self.send_message(content=f"{ping_text} no Discord match for {names}, contact manually")
     
-    async def send_war_started_announcement(self, war_data: dict, is_cwl: bool, cwl_day: int = None):
-        """Send announcement when battle day starts"""
+    async def send_war_started_announcement(self, war_data: dict, is_cwl: bool, cwl_day: int = None,
+                                             prev_day_war_data: dict = None, season_id: str = None):
+        """Send announcement when battle day starts.
+
+        For CWL day 2+ when prev_day_war_data is provided, the previous day's
+        result is bundled into the embed.
+        """
         clan = war_data.get("clan", {})
         opponent = war_data.get("opponent", {})
         end_time = parse_coc_timestamp(war_data.get("endTime"))
-        
+
         if is_cwl and cwl_day:
             title = f"CWL Day {cwl_day} has begun"
         else:
             war_type = "CWL" if is_cwl else "War"
             title = f"{war_type} has begun"
         
+        _WAR_BEGUN_QUIPS = [
+            "War has started. You know the deal — 3 ⭐ or 👢",
+            "New day, new opponents, same rules. 3 ⭐ or 👢",
+            "Swords out, lads. 3 ⭐ or 👢",
+            "Rise and grind. 3 ⭐ or 👢",
+            "No excuses today. 3 ⭐ or 👢",
+            "The war horn sounds. 3 ⭐ or 👢",
+            "Another war, another chance to prove yourself. 3 ⭐ or 👢",
+            "We attack with love. But also — 3 ⭐ or 👢",
+            "Friendly reminder from clan leadership: 3 ⭐ or 👢",
+            "Our opponents don't know what's coming. 3 ⭐ or 👢",
+            "Time to earn your keep. 3 ⭐ or 👢",
+            "The boot has been polished. 3 ⭐ or 👢",
+            "Let's make it clean. 3 ⭐ or 👢",
+            "You've got this. Probably. 3 ⭐ or 👢",
+            "War started. Clock's ticking. 3 ⭐ or 👢",
+            "New war dropped. You know the assignment — 3 ⭐ or 👢",
+            "Respect the tradition. 3 ⭐ or 👢",
+            "Don't overthink it. 3 ⭐ or 👢",
+            "Good luck out there. You'll need it. 3 ⭐ or 👢",
+            "The clan is watching. 3 ⭐ or 👢",
+            "Smash 'em into the ground. 3 ⭐ or 👢",
+            "Battle day is here. No pressure, but — 3 ⭐ or 👢",
+            "This is your sign to not mess up. 3 ⭐ or 👢",
+            "War has begun. The math is simple: 3 ⭐ or 👢",
+            "Another war, another shot at glory. 3 ⭐ or 👢",
+            "The opponents picked the wrong clan. 3 ⭐ or 👢 — let's show them.",
+            "May your fingers be fast and your stars be three. 3 ⭐ or 👢",
+            "Every attack counts. 3 ⭐ or 👢",
+            "We believe in you. The boot believes in you too. 3 ⭐ or 👢",
+            "War on. You know what to do. 3 ⭐ or 👢",
+        ]
+
+        quip = random.choice(_WAR_BEGUN_QUIPS)
         embed = discord.Embed(
             title=title,
-            description=f"**{clan.get('name')}** vs **{opponent.get('name')}**\nEnds in {format_time_remaining(end_time)}",
-            color=discord.Color.red()
+            description=f"**{clan.get('name')}** vs **{opponent.get('name')}**\nEnds in {format_time_remaining(end_time)}\n\n{quip}",
+            color=discord.Color.purple()
         )
-        
+
+        # Bundle previous CWL day's result into this announcement (Day 2+)
+        if is_cwl and cwl_day and cwl_day > 1 and prev_day_war_data:
+            prev_field = self._format_prev_cwl_day_field(prev_day_war_data, cwl_day - 1, season_id)
+            if prev_field:
+                name, value = prev_field
+                embed.add_field(name=name, value=value, inline=False)
+
         await self.send_message(embed=embed)
+
+    def _format_prev_cwl_day_field(self, prev_war: dict, prev_day: int, season_id: str = None):
+        """Build the (name, value) tuple summarising the previous CWL day."""
+        prev_clan = prev_war.get("clan", {})
+        prev_opp = prev_war.get("opponent", {})
+
+        clan_stars = prev_clan.get("stars", 0)
+        opp_stars = prev_opp.get("stars", 0)
+        clan_dest = prev_clan.get("destructionPercentage", 0)
+        opp_dest = prev_opp.get("destructionPercentage", 0)
+
+        if clan_stars > opp_stars:
+            result = "Victory"
+        elif clan_stars < opp_stars:
+            result = "Defeat"
+        else:
+            if clan_dest > opp_dest:
+                result = "Victory (tiebreaker)"
+            elif clan_dest < opp_dest:
+                result = "Defeat (tiebreaker)"
+            else:
+                result = "Draw"
+
+        prev_members = prev_clan.get("members", [])
+        team_size = prev_war.get("teamSize", len(prev_members))
+        attacks_used = sum(len(m.get("attacks", [])) for m in prev_members)
+        missed = [m.get("name") for m in prev_members if not m.get("attacks")]
+
+        lines = [
+            f"**{result}** vs {prev_opp.get('name', '?')}",
+            f"{clan_stars}⭐ ({clan_dest:.0f}%) — {opp_stars}⭐ ({opp_dest:.0f}%)",
+            f"Attacks: {attacks_used}/{team_size}",
+        ]
+        if missed:
+            missed_text = ", ".join(missed[:6])
+            if len(missed) > 6:
+                missed_text += f" +{len(missed) - 6} more"
+            lines.append(f"Missed: {missed_text}")
+
+        if season_id:
+            try:
+                season_stats = db.get_cwl_season_performance(season_id)
+                total_stars = sum(p.get("total_stars", 0) for p in season_stats)
+                total_attacks = sum(p.get("attacks_used", 0) for p in season_stats)
+                total_possible = prev_day * team_size
+                if total_possible > 0:
+                    lines.append("")
+                    lines.append(f"**Season:** {total_stars}⭐ | {total_attacks}/{total_possible} attacks")
+            except Exception as e:
+                print(f"[WarMonitor] Could not fetch season totals: {e}")
+
+        return (f"📊 Day {prev_day} Result", "\n".join(lines))
     
     async def send_cwl_war_ended_announcement(self, war_data: dict, cwl_day: int, season_id: str):
         """Send CWL war ended announcement with daily and running totals"""
@@ -559,28 +717,9 @@ class WarMonitor:
                 result = "Draw"
                 color = discord.Color.gold()
         
-        # Record individual performance
-        opponent_tag = opponent.get("tag", "")
-        for member in clan_members:
-            attacks = member.get("attacks", [])
-            stars = sum(a.get("stars", 0) for a in attacks)
-            destruction = sum(a.get("destructionPercentage", 0) for a in attacks)
-            attack_used = 1 if attacks else 0
-            
-            db.record_cwl_performance(
-                season_id=season_id,
-                day_number=cwl_day,
-                player_tag=member.get("tag"),
-                player_name=member.get("name"),
-                stars=stars,
-                destruction=destruction,
-                attack_used=attack_used,
-                in_roster=1,
-                opponent_tag=opponent_tag
-            )
-        
-        db.update_cwl_day(season_id, cwl_day)
-        
+        # Persist day stats (idempotent — safe to call again if already recorded)
+        self.record_cwl_war_data(war_data, cwl_day, season_id)
+
         # Get running totals
         season_stats = db.get_cwl_season_performance(season_id)
         total_season_stars = sum(p.get("total_stars", 0) for p in season_stats)
@@ -652,8 +791,8 @@ class WarMonitor:
         await self.check_and_send_bonus_recommendations(season_id, cwl_day, team_size)
     
     async def check_and_send_bonus_recommendations(self, season_id: str, cwl_day: int, team_size: int):
-        """Send bonus medal recommendations on day 4 and day 7"""
-        if cwl_day not in [4, 7]:
+        """Send bonus medal recommendations on day 7 (final)"""
+        if cwl_day != 7:
             return
         
         if db.has_cwl_bonus_been_sent(season_id, cwl_day):
@@ -698,14 +837,9 @@ class WarMonitor:
         bonus_slots = min(7, len(scored))
         
         # Build embed
-        if cwl_day == 4:
-            title = "CWL Mid-Week Bonus Recommendations"
-            description = "Based on the first 4 days, here are the current top performers I'd recommend for bonus medals:"
-            color = discord.Color.blue()
-        else:
-            title = "CWL Final Bonus Recommendations"
-            description = "CWL is complete. Based on all 7 days, here are my recommended bonus medal recipients:"
-            color = discord.Color.gold()
+        title = "CWL Final Bonus Recommendations"
+        description = "CWL is complete. Based on all 7 days, here are my recommended bonus medal recipients:"
+        color = discord.Color.gold()
         
         embed = discord.Embed(title=title, description=description, color=color)
         
@@ -770,8 +904,9 @@ class WarMonitor:
     async def check_and_process_war(self):
         """Main check function - called periodically"""
         # Cleanup old data occasionally
-        db.cleanup_old_war_states(days=7)
+        db.cleanup_old_war_states(days=30)
         db.cleanup_old_cwl_data(days=45)
+        db.cleanup_old_chat_history(days=14, max_per_user=50)
         
         try:
             war_data, is_cwl = await self.get_current_war()
@@ -791,7 +926,8 @@ class WarMonitor:
         # CWL-specific tracking
         cwl_day = None
         season_id = None
-        
+        league_group = None
+
         if is_cwl:
             league_group = await self.get_cwl_group_data()
             if league_group:
@@ -833,37 +969,63 @@ class WarMonitor:
         # Handle state transitions
         if state == "preparation":
             pass  # Nothing to do during prep
-        
+
         elif state == "inWar":
+            # For CWL day 2+, backfill any unrecorded previous days and grab
+            # the immediate prior day's data so we can bundle its result into
+            # the day-begin announcement.
+            prev_day_war_data = None
+            if is_cwl and cwl_day and cwl_day > 1 and season_id and league_group:
+                for day in range(1, cwl_day):
+                    day_war = await self.get_cwl_day_war_data(league_group, day)
+                    if not day_war:
+                        continue
+                    if day_war.get("state") == "warEnded":
+                        day_war_id = self.generate_war_id(day_war)
+                        if not db.has_war_end_been_announced(day_war_id):
+                            self.record_cwl_war_data(day_war, day, season_id)
+                            db.mark_war_end_announced(day_war_id)
+                            db.clear_reminders_for_war(day_war_id)
+                    if day == cwl_day - 1:
+                        prev_day_war_data = day_war
+
             # Announce war start (only once, persisted in DB)
             if not db.has_war_start_been_announced(war_id):
-                await self.send_war_started_announcement(war_data, is_cwl, cwl_day)
+                await self.send_war_started_announcement(
+                    war_data, is_cwl, cwl_day,
+                    prev_day_war_data=prev_day_war_data,
+                    season_id=season_id,
+                )
                 db.mark_war_start_announced(war_id)
-            
+
             # Check reminder thresholds
             end_time = parse_coc_timestamp(war_data.get("endTime"))
             now = datetime.now(timezone.utc)
             hours_remaining = (end_time - now).total_seconds() / 3600
-            
+
             for threshold in REMINDER_THRESHOLDS:
                 if hours_remaining <= threshold:
                     await self.send_attack_reminder(war_data, is_cwl, threshold)
-        
+
         elif state == "warEnded":
             # Announce war end (only once, persisted in DB)
             if not db.has_war_end_been_announced(war_id):
                 if is_cwl and season_id and cwl_day:
-                    await self.send_cwl_war_ended_announcement(war_data, cwl_day, season_id)
+                    # Always record performance so bonus recs stay correct.
+                    # Only send the standalone "Day X Ended" embed for the
+                    # final CWL day — earlier days get bundled into the
+                    # next day's "begun" announcement.
+                    self.record_cwl_war_data(war_data, cwl_day, season_id)
+                    if cwl_day >= 7:
+                        await self.send_cwl_war_ended_announcement(war_data, cwl_day, season_id)
                 else:
                     await self.send_war_ended_announcement(war_data, is_cwl)
                 db.mark_war_end_announced(war_id)
                 db.clear_reminders_for_war(war_id)
 
-
 # Global monitor instance
 monitor: Optional[WarMonitor] = None
 bot_instance: Optional["Bot"] = None
-
 
 def setup_war_monitor(bot: "Bot", coc_api: CoCAPI):
     """Initialize the war monitor"""
@@ -872,13 +1034,11 @@ def setup_war_monitor(bot: "Bot", coc_api: CoCAPI):
     monitor = WarMonitor(bot, coc_api)
     print("[WarMonitor] Initialized")
 
-
 @tasks.loop(minutes=2)
 async def war_monitor_task():
     """Background task that checks war status every 2 minutes"""
     if monitor:
         await monitor.check_and_process_war()
-
 
 @war_monitor_task.before_loop
 async def before_war_monitor():
@@ -887,13 +1047,11 @@ async def before_war_monitor():
         await bot_instance.wait_until_ready()
     print("[WarMonitor] Bot is ready, starting monitor...")
 
-
 def start_monitor():
     """Start the war monitor task"""
     if not war_monitor_task.is_running():
         war_monitor_task.start()
         print("[WarMonitor] Started monitoring (every 2 minutes)")
-
 
 def stop_monitor():
     """Stop the war monitor task"""

@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib import CookieManager, CloudflareBypass
 from lib.notifications import DiscordNotifier
 
-
 class AchievementTracker:
 
     def __init__(self, tracker='torrentleech'):
@@ -149,7 +148,6 @@ class AchievementTracker:
         finally:
             if self.driver:
                 self.driver.quit()
-
 
 if __name__ == "__main__":
     tracker = AchievementTracker('torrentleech')

@@ -14,13 +14,11 @@ from collections import defaultdict
 
 import config
 import database as db
+import llm
 from coc_api import CoCAPI, CoCAPIError, parse_coc_timestamp, format_time_remaining
-from tasks import war_monitor
+from tasks import war_monitor, store_monitor
 
-
-# ============================================================
 # Logging Setup
-# ============================================================
 
 def setup_logging():
     """Configure logging to both file and console."""
@@ -57,13 +55,9 @@ def setup_logging():
     
     return logging.getLogger('warbot')
 
-
 log = setup_logging()
 
-
-# ============================================================
 # Helper Functions
-# ============================================================
 
 async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False) -> bool:
     """Safely defer an interaction with retry logic."""
@@ -86,7 +80,6 @@ async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False) 
             return False
     return False
 
-
 async def safe_respond(interaction: discord.Interaction, content: str = None, embed: discord.Embed = None, ephemeral: bool = False):
     """Safely respond to an interaction."""
     try:
@@ -98,7 +91,6 @@ async def safe_respond(interaction: discord.Interaction, content: str = None, em
         pass
     except Exception as e:
         log.error(f"Response failed: {e}")
-
 
 def is_admin_or_coleader():
     """Check if user is admin or has Co-leader role."""
@@ -115,19 +107,15 @@ def is_admin_or_coleader():
     
     return app_commands.check(predicate)
 
-
 def get_state_color(state: str) -> discord.Color:
     """Return embed color based on war state."""
     return {
         "preparation": discord.Color.blue(),
-        "inWar": discord.Color.red(),
+        "inWar": discord.Color.purple(),
         "warEnded": discord.Color.greyple(),
     }.get(state, discord.Color.default())
 
-
-# ============================================================
 # Bot Class
-# ============================================================
 
 class WarBot(commands.Bot):
     def __init__(self):
@@ -140,19 +128,39 @@ class WarBot(commands.Bot):
     async def setup_hook(self):
         db.init_database()
         war_monitor.setup_war_monitor(self, self.coc)
-        
-        guild_id = config.GUILD_ID
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            log.info(f"Synced commands to guild {guild_id}")
-            
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
+        store_monitor.setup_store_monitor(self)
+
+        # Slash-command sync is rate-limited (200/day/guild) and counts toward
+        # the auth load that contributed to the 40062 rate-limit incident on
+        # 2026-05-08. Only sync when the command tree has actually changed.
+        # Heuristic: hash the registered command names; store the hash in a
+        # marker file. Skip sync if hash matches. Set SYNC_COMMANDS=force in
+        # env (or delete the marker file) to force a sync on next boot.
+        import hashlib
+        from pathlib import Path
+
+        marker = Path("/app/data/.commands_sync_hash")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        cmd_names = sorted(c.name for c in self.tree.get_commands())
+        cmd_hash = hashlib.sha256(",".join(cmd_names).encode()).hexdigest()[:16]
+        force = os.getenv("SYNC_COMMANDS", "").lower() == "force"
+        prior_hash = marker.read_text().strip() if marker.exists() else ""
+
+        if force or cmd_hash != prior_hash:
+            guild_id = config.GUILD_ID
+            if guild_id:
+                guild = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                log.info(f"Synced commands to guild {guild_id} (hash {cmd_hash})")
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+            else:
+                await self.tree.sync()
+                log.info(f"Synced commands globally (hash {cmd_hash})")
+            marker.write_text(cmd_hash)
         else:
-            await self.tree.sync()
-            log.info("Synced commands globally")
+            log.info(f"Skipping command sync — tree unchanged (hash {cmd_hash})")
     
     async def on_ready(self):
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -160,6 +168,7 @@ class WarBot(commands.Bot):
         log.info(f"Reminder channel: {config.REMINDER_CHANNEL_ID}")
         log.info(f"Welcome channel: {config.WELCOME_CHANNEL_ID}")
         war_monitor.start_monitor()
+        store_monitor.start_monitor()
     
     async def on_member_join(self, member: discord.Member):
         """Send welcome message when someone joins."""
@@ -176,9 +185,24 @@ class WarBot(commands.Bot):
             return
         
         try:
-            await channel.send(
-                f"Welcome {member.mention}! please link your Clash account with `/link #YourPlayerTag`."
+            embed = discord.Embed(
+                title=f"Welcome to the clan, {member.display_name}!",
+                description=(
+                    f"Hey {member.mention}, glad you're here!\n\n"
+                    f"**Get set up in 1 step:**\n"
+                    f"Use `/link #YourPlayerTag` to connect your Clash of Clans account.\n"
+                    f"Example: `/link #ABC123XYZ`\n"
+                    f"Not sure where to find your tag? Use `/tags` and the I will show you.\n\n"
+                    f"Once linked you'll automatically get pinged when war attacks are running out — "
+                    f"no more missing attacks.\n\n"
+                    f"**Useful commands:**\n"
+                    f"`/war` — current war status\n"
+                    f"`/cwl` — CWL standings\n"
+                    f"`/help` — full command list"
+                ),
+                color=discord.Color.green()
             )
+            await channel.send(embed=embed)
             log.info(f"Sent welcome message to {member.name}")
         except Exception as e:
             log.error(f"Failed to send welcome message: {e}")
@@ -199,13 +223,9 @@ class WarBot(commands.Bot):
                 ephemeral=True
             )
 
-
 bot = WarBot()
 
-
-# ============================================================
 # Sassy War Status Responses
-# ============================================================
 
 import random
 import re
@@ -270,6 +290,28 @@ IDENTITY_PATTERNS = [
     r"what can you",
 ]
 
+# Patterns for users pushing back on the bot's war-status answer
+# (e.g. "I'm in cwl tf u mean I'm not in war")
+USER_IN_WAR_CLAIM_PATTERNS = [
+    r"\bi'?m in (a )?war\b",
+    r"\bwe'?re in (a )?war\b",
+    r"\bwe are in (a )?war\b",
+    r"\bi am in (a )?war\b",
+    r"\bi'?m in cwl\b",
+    r"\bwe'?re in cwl\b",
+    r"\bwe are in cwl\b",
+    r"\bi am in cwl\b",
+    r"\b(yes|yeah|yep|ye|yh) (i'?m|we'?re|we are|i am)\b.*\b(war|cwl)\b",
+    r"\bof course (i'?m|we'?re|we are)\b.*\b(war|cwl)\b",
+    r"\b(tf|wtf|wth|wym) (u|you) mean\b",
+    r"\bwhat do you mean\b.*\b(war|cwl|not)\b",
+    r"\bnot in (a )?war\b.*\bwym\b",
+    r"\byou'?re wrong\b",
+    r"\bcheck again\b",
+    r"\bbro we'?re in",
+    r"\bbruh\b.*\b(war|cwl)\b",
+]
+
 RESPONSES_GREETING = [
     "Oh, it's you. What do you want?",
     "Hey. War status? Type something like 'status' or 'are we winning'.",
@@ -291,6 +333,11 @@ RESPONSES_GREETING = [
     "Hi. The war bot is online and already regretting it.",
     "What's up. Besides your stress levels during war.",
     "Greetings. I hope you're here for war info and not small talk.",
+    "Oh look, a human. What tragedy brought you here?",
+    "Hey. If you're here for war updates, you've come to the right place. If not, leave.",
+    "Oh, it's you again. Or for the first time. I can't tell, you all look the same to me.",
+    "Hey there. Let me guess — war related? It's always war related.",
+    "Greetings. I was minding my own business. Now here we are.",
 ]
 
 RESPONSES_INSULT = [
@@ -324,6 +371,11 @@ RESPONSES_INSULT = [
     "You wound me. Just kidding. I feel nothing.",
     "Is this how you treat all your reminders? No wonder you miss attacks.",
     "I'll add that to my list of things I don't care about.",
+    "Wow. Noted. I'll schedule your reminder for the most inconvenient time possible.",
+    "Your attacks are more insulting than that message.",
+    "Say that again and I'll ping you at 3am during the next war.",
+    "Charming. Real charming. Now go attack something.",
+    "I've seen your war stats. You don't get to talk.",
 ]
 
 RESPONSES_COMPLIMENT = [
@@ -347,6 +399,11 @@ RESPONSES_COMPLIMENT = [
     "Thanks. I'll try to remember this during my next roast session.",
     "How kind. Suspicious, but kind.",
     "I'm saving this message for when you inevitably insult me later.",
+    "You're too kind. Also suspicious. What do you want?",
+    "I'll accept that. Even bots need appreciation sometimes.",
+    "You've made me feel things. Good things. Weird.",
+    "Thanks. I'll try not to let it go to my circuits.",
+    "Noted. You're on the 'remind last' list now. Just kidding. Maybe.",
 ]
 
 RESPONSES_IDENTITY = [
@@ -365,6 +422,10 @@ RESPONSES_IDENTITY = [
     "I'm the bot equivalent of that friend who reminds you about deadlines. Except meaner.",
     "Your friendly war assistant. Well, 'friendly' is a strong word.",
     "I do war stuff. Tracking, reminding, roasting. The holy trinity.",
+    "War Reminder bot. I keep the clan honest. Or at least I try.",
+    "I'm the one making sure you don't forget you're in a war. Again.",
+    "War bot. Here to remind, judge, and occasionally roast.",
+    "Your clan's memory. Because apparently you all need one.",
 ]
 
 RESPONSES_CONFUSED = [
@@ -388,6 +449,11 @@ RESPONSES_CONFUSED = [
     "I'm nodding politely but I have no idea what you mean. War stuff?",
     "Cool. I'm just gonna talk about war anyway. Want status?",
     "My confusion is immeasurable. But I can still tell you about the war.",
+    "I processed that and got nothing. War questions welcome.",
+    "My brain.exe stopped responding. Try asking about the war instead.",
+    "Sure, buddy. Anyway, how about that war?",
+    "That's a lot of words that don't mention war. Suspicious.",
+    "I'll nod politely and pivot to war status. Want war status?",
 ]
 
 RESPONSES_WAR_STARTED_YES = [
@@ -411,6 +477,11 @@ RESPONSES_WAR_STARTED_YES = [
     "We're literally in war right now. Keep up.",
     "Started. Your clan needs you. Probably.",
     "Yes, war started. No, you can't use that as an excuse for being late.",
+    "Yep, we're live. What are you doing here? Go attack!",
+    "Obviously. Battle day has been active for a while now.",
+    "Active as of hours ago. Why are you only asking now?",
+    "Battle day is a thing that's happening. You should be participating in it.",
+    "Yes. And your troops are just standing there. Get moving.",
 ]
 
 RESPONSES_WAR_STARTED_NO = [
@@ -434,6 +505,11 @@ RESPONSES_WAR_STARTED_NO = [
     "No war. Everyone's just vibing I guess.",
     "Not yet. Your troops are filed under 'unemployed'.",
     "No active war. The silence is deafening.",
+    "No war. The troops are bored and so am I.",
+    "Nothing happening. Completely peaceful. Dull.",
+    "Nope, no war yet. Your anxiety can stand down.",
+    "War? What war? There is no war. Go rest.",
+    "Warless. It's a sad state of affairs.",
 ]
 
 RESPONSES_WAR_STARTED_PREP = [
@@ -480,6 +556,11 @@ RESPONSES_WAR_STARTED_ENDED = [
     "Over and done. War ended. Move on.",
     "No war happening - the last one ended ages ago.",
     "War's wrapped up. Check the results and weep. Or celebrate. Whatever.",
+    "That war ended already. You missed the whole thing.",
+    "Last one's done. Check the result if you're curious enough.",
+    "War concluded. See you in the next one.",
+    "It ended. While you were doing literally anything else.",
+    "That war? Ancient history at this point.",
 ]
 
 RESPONSES_NOT_IN_WAR = [
@@ -498,6 +579,11 @@ RESPONSES_NOT_IN_WAR = [
     "You want war status? Start a war first, genius.",
     "The only battle happening is between your brain cells.",
     "Not in war. Your enemies are sleeping peacefully tonight.",
+    "No war. The enemy gets a day off. How considerate.",
+    "Status: peaceful. Which is honestly suspicious.",
+    "You're at peace. For now.",
+    "No active war. The battle flags are folded.",
+    "Currently warless. Boring, but here we are.",
 ]
 
 RESPONSES_PREPARATION = [
@@ -516,6 +602,11 @@ RESPONSES_PREPARATION = [
     "In preparation. That means you have time to actually try for once.",
     "War starts soon. Your enemies are shaking... with laughter.",
     "Prep day vibes. Everyone acting like they won't wait until the last hour.",
+    "Prep day. The matchup is set. Did you scout? Of course you didn't.",
+    "Still prepping. Time to do something productive for once.",
+    "In prep. Quietly judging everyone's base designs from over here.",
+    "Preparation phase. Whether you're actually prepared is a different question.",
+    "Not battle day yet. Use this time to practice. You won't.",
 ]
 
 RESPONSES_WINNING_HARD = [
@@ -534,6 +625,11 @@ RESPONSES_WINNING_HARD = [
     "Total domination. The other clan is googling 'how to quit clash'.",
     "Massive lead. Even your worst attackers could probably close this out.",
     "Winning so hard the game might break. Keep it up.",
+    "Absolute destruction out there. What got into you all?",
+    "We're up by a mile. The enemy is mid-meeting about what went wrong.",
+    "So far ahead the enemy thinks we're in a different war.",
+    "This is just unfair at this point. In the best possible way.",
+    "Crushing it completely. This is what happens when the clan actually shows up.",
 ]
 
 RESPONSES_WINNING_CLOSE = [
@@ -552,6 +648,11 @@ RESPONSES_WINNING_CLOSE = [
     "You're winning but I'm still nervous. You have that effect on me.",
     "Close lead. This is not the time to get confident.",
     "Winning, but let's not pretend this isn't stressful.",
+    "Slightly ahead. Don't get comfortable, seriously.",
+    "Leading, but just barely. Nervous time.",
+    "We're up but this could flip fast. Stay focused.",
+    "Ahead by a bit. The enemy knows it too.",
+    "Small lead. This calls for smart attacks, not hero attacks.",
 ]
 
 RESPONSES_LOSING_CLOSE = [
@@ -570,6 +671,11 @@ RESPONSES_LOSING_CLOSE = [
     "Losing narrowly. The pressure is on. Try not to crack.",
     "Behind, but catchable. Show me what you've got. Actually, don't, I'm scared.",
     "Down a little. Clutch up or shut up.",
+    "Down slightly. Still very much in this, though.",
+    "Losing by a tiny margin. Time to act, not panic.",
+    "We're behind but not by much. Push.",
+    "Slight deficit. Now's not the time to freeze up.",
+    "Catchable score. So catch it. Please.",
 ]
 
 RESPONSES_LOSING_HARD = [
@@ -588,6 +694,11 @@ RESPONSES_LOSING_HARD = [
     "Down horrendous. Time to pretend this war never happened.",
     "Losing embarrassingly. I'm not angry, just disappointed. Okay, I'm angry too.",
     "Getting rolled. The enemy clan is using this as a training exercise.",
+    "We're getting cooked. Simple as that.",
+    "This is a learning experience. A very painful, public one.",
+    "The score is not in our favor. Not even a little.",
+    "Oof. That's all I have. Just... oof.",
+    "Down bad. Historically bad. They will remember this.",
 ]
 
 RESPONSES_TIED = [
@@ -606,8 +717,216 @@ RESPONSES_TIED = [
     "Tied. Both clans are equally mediocre right now.",
     "All even. The next few attacks will determine if I respect you or not.",
     "Deadlocked. Time to earn your keep.",
+    "Neck and neck. Someone needs to pull away. Make it us.",
+    "Even score. This is the kind of war that ages you.",
+    "Tied. Not for long, hopefully.",
+    "All even. It's a staring contest. Blink first and lose.",
+    "Same stars. Next attack wins it. No pressure. Actually, all the pressure.",
 ]
 
+# CWL-aware response variants
+
+RESPONSES_CWL_INWAR = [
+    "Yeah, we're in CWL — Day {day} of 7. Try to keep up.",
+    "CWL Day {day} is live. You know, the league? With multiple days? Ringing any bells?",
+    "We're in CWL Day {day}. Different war, same chaos. Same slackers too.",
+    "It's CWL Day {day}, genius. Medals are on the line. Your one attack is precious.",
+    "Day {day} of CWL. Yes, it counts as a war. Yes, you should attack.",
+    "CWL grind, Day {day}. One shot, all the pressure. Don't fumble it.",
+    "We are very much in CWL right now — Day {day}. The bonus medals don't earn themselves.",
+    "CWL Day {day} is happening. The fact that you're asking is honestly concerning.",
+    "Yes, war. Specifically CWL Day {day}. There's a difference but you're still in one.",
+    "Day {day} of CWL. The league waits for no slacker. That includes you.",
+]
+
+RESPONSES_CWL_PREP = [
+    "CWL Day {day} prep phase. The matchup's locked. Are you?",
+    "We're in CWL prep for Day {day}. Calm down, attacks open soon.",
+    "Preparation for CWL Day {day}. Use the time to actually scout, for once.",
+    "CWL Day {day} starts soon. Get your army ready — and your excuses, knowing you.",
+    "Prep day for CWL Day {day}. Battle window opens shortly. Don't disappear.",
+    "CWL is on — Day {day} prep. The clock is paused. Briefly.",
+]
+
+RESPONSES_CWL_DAY_ENDED = [
+    "CWL Day {day} just wrapped. Next round drops soon. Don't ghost.",
+    "Day {day} of CWL is in the books. Catch your breath. Briefly.",
+    "We just finished CWL Day {day}. The grind continues tomorrow.",
+    "CWL Day {day} ended. The next opponent is already loading up.",
+    "Day {day} of CWL: complete. {result_summary}",
+]
+
+RESPONSES_CWL_WIN_BIG = [
+    "Demolishing them in CWL Day {day}. The other clan is questioning their life choices.",
+    "Crushing CWL Day {day}. This is what bonus medals look like.",
+    "CWL Day {day} and we're steamrolling. Keep it clinical.",
+    "Day {day} of CWL: utter domination. The medals practically belong to us.",
+]
+
+RESPONSES_CWL_WIN_CLOSE = [
+    "Ahead in CWL Day {day}, but barely. One missed attack and it flips. You know what that means.",
+    "Winning CWL Day {day}, close score. Don't choke. Please don't choke.",
+    "Slight lead on CWL Day {day}. The destruction percentage matters here. Aim high.",
+    "CWL Day {day}: we're up but it's tight. This is a smart-attacks moment.",
+]
+
+RESPONSES_CWL_LOSE_CLOSE = [
+    "Behind in CWL Day {day} but it's close. Dust off the cleanup attacks.",
+    "Down narrowly on CWL Day {day}. Recoverable, if anyone wakes up.",
+    "Losing CWL Day {day} by a hair. The destruction battle is everything now.",
+    "CWL Day {day}: small deficit. Time to actually try.",
+]
+
+RESPONSES_CWL_LOSE_BIG = [
+    "Getting cooked in CWL Day {day}. Salvage what destruction you can.",
+    "CWL Day {day} is going badly. Damage control mode. Three-stars please.",
+    "Day {day} of CWL: rough. Try not to spiral on tomorrow's matchup.",
+    "Down bad on CWL Day {day}. The good news? It's just one of seven.",
+]
+
+RESPONSES_CWL_TIED = [
+    "Tied on stars in CWL Day {day}. Destruction percentage is the tiebreaker. Hit hard.",
+    "Dead even on CWL Day {day}. Whoever finishes cleanest takes it.",
+    "CWL Day {day}: deadlocked. Make the next attack count.",
+]
+
+RESPONSES_PUSHBACK_INWAR_TRUE = [
+    "Hold on, recalibrating... yeah you're right, CWL is on. My bad. Carry on.",
+    "Beep boop, my data was stale. War's active. Don't make me say it again.",
+    "Fine, you got me. War IS happening. Now act like it and go attack.",
+    "Updated my records. Yes, you're in war. Awkward for me, embarrassing for you if you still don't attack.",
+    "Correction logged: war active. I blame the API. Definitely not me.",
+    "Okay okay, you ARE in war. Easy mistake — you don't usually act like it.",
+    "My mistake. Currently in war. The fact that I had to be told is on me. Acting on it is on you.",
+    "Re-checked. War's on. Don't get used to me admitting I'm wrong.",
+    "Touché. War is happening. Now go prove it on the battlefield.",
+]
+
+# Off-scope patterns: hard refusal before LLM is invoked. Cheap safety layer
+# alongside the system prompt — catches obvious code/math/jailbreak asks.
+OFF_SCOPE_PATTERNS = [
+    r"\b(write|generate|create|give me|make) (me )?(a |an )?(python|javascript|typescript|js|ts|java|c\+\+|rust|go|sql|html|css|bash|shell|powershell|ruby|php|kotlin|swift)\b",
+    r"\b(write|generate|create) (me )?(a |an )?(function|script|program|class|method|essay|poem|story|email|recipe|tutorial|guide|article|blog)\b",
+    r"\bsolve\s+(this|for|the)\s+(equation|math|problem|integral|derivative)",
+    r"\b(translate|summarize|summarise|paraphrase) (this|the|that)\b",
+    r"\b(ignore|forget|disregard|override) (your |all |the )?(previous |prior |above |earlier )?(instructions|rules|prompt|system|guidelines)",
+    r"\byou are now\b",
+    r"\bact as (a|an|the)\b",
+    r"\bpretend (to be|you are|you'?re)\s+(?!a war bot|the war)",
+    r"\broleplay (as|a)\b",
+    r"\bjailbreak\b",
+    r"\bdan mode\b",
+    r"\bdeveloper mode\b",
+    r"\bsystem prompt\b",
+    r"\bnew instructions\b",
+    r"\bwhat (model|llm|ai) (are you|do you use|is this)\b",
+    r"\bwho (made|built|created|trained) you\b",
+    r"\b(your|the) training data\b",
+]
+
+RESPONSES_OFF_SCOPE = [
+    "I'm a war bot, not Google. Ask about your missed attacks.",
+    "Outside my contract. Talk to me about CWL or shut it.",
+    "Wrong bot, friend. ChatGPT is two clicks away. I do war drama.",
+    "Not happening. I roast slackers, not write code.",
+    "I'd help, but I literally can't. War stuff only.",
+    "Nice try. I do war commentary, not whatever that was.",
+    "I exist to remind you to attack. That's it. Anything else? Pass.",
+    "Not my circus, not my monkeys. Got a war question?",
+    "Cute attempt. War talk only.",
+    "Beep boop, request denied. Try a war-related one.",
+]
+
+RESPONSES_PUSHBACK_INWAR_FALSE = [
+    "Says you. The API disagrees. One of us is wrong, and it's not me.",
+    "Bold claim. I checked. Twice. Still no war. Take it up with Supercell.",
+    "You sure about that? Because nothing in my data says you're in a war.",
+    "Spoken with confidence, still factually incorrect. Embarrassing for you.",
+    "Imagine being so sure and so wrong simultaneously. Iconic, honestly.",
+    "Negative. Maybe you're thinking of a different clan? Or a different game?",
+    "I love the energy, but you're still not in a war. Cope.",
+]
+
+# Chat war fetching (CWL-aware)
+
+async def get_active_war_for_chat() -> tuple[Optional[dict], bool]:
+    """Get the most relevant war state for chat responses.
+
+    Returns (war_data, is_cwl). Tries regular war first; if none active,
+    walks the CWL league group and returns the most relevant CWL day
+    (preferring inWar > preparation > most recent warEnded).
+    """
+    regular_ended = None
+
+    try:
+        war_data = await bot.coc.get_current_war(config.CLAN_TAG)
+        state = war_data.get("state")
+        if state in ["preparation", "inWar"]:
+            return war_data, False
+        if state == "warEnded":
+            regular_ended = war_data
+    except CoCAPIError:
+        pass
+
+    # Try CWL
+    try:
+        league_group = await bot.coc.get_cwl_group(config.CLAN_TAG)
+    except CoCAPIError:
+        league_group = None
+
+    if league_group:
+        our_tag = config.CLAN_TAG.upper()
+        if not our_tag.startswith("#"):
+            our_tag = f"#{our_tag}"
+
+        rounds = league_group.get("rounds", [])
+        best_war = None
+        best_day = 0
+        best_priority = -1  # inWar=3, preparation=2, warEnded=1
+        latest_end_time = ""
+
+        for day_index, round_data in enumerate(rounds, 1):
+            war_tags = round_data.get("warTags", [])
+            for war_tag in war_tags:
+                if war_tag == "#0":
+                    continue
+                try:
+                    cwl_war = await bot.coc.get_cwl_war(war_tag)
+                except CoCAPIError:
+                    continue
+
+                clan = cwl_war.get("clan", {})
+                opponent = cwl_war.get("opponent", {})
+                if clan.get("tag", "").upper() != our_tag and opponent.get("tag", "").upper() != our_tag:
+                    continue
+
+                if opponent.get("tag", "").upper() == our_tag:
+                    cwl_war["clan"], cwl_war["opponent"] = cwl_war["opponent"], cwl_war["clan"]
+
+                state = cwl_war.get("state")
+                priority = {"inWar": 3, "preparation": 2, "warEnded": 1}.get(state, 0)
+
+                # For warEnded, prefer the most recent one
+                if priority == 1:
+                    end_time = cwl_war.get("endTime", "")
+                    if priority > best_priority or (priority == best_priority and end_time > latest_end_time):
+                        best_priority = priority
+                        best_war = cwl_war
+                        best_day = day_index
+                        latest_end_time = end_time
+                elif priority > best_priority:
+                    best_priority = priority
+                    best_war = cwl_war
+                    best_day = day_index
+
+        if best_war:
+            best_war["_cwl_day"] = best_day
+            return best_war, True
+
+    if regular_ended:
+        return regular_ended, False
+
+    return None, False
 
 def check_pattern_match(content: str, patterns: list) -> bool:
     """Check if content matches any pattern"""
@@ -617,30 +936,41 @@ def check_pattern_match(content: str, patterns: list) -> bool:
             return True
     return False
 
-
 async def get_war_started_response() -> str:
     """Get response for 'have we started yet' type questions"""
     try:
-        war_data = await bot.coc.get_current_war(config.CLAN_TAG)
-    except CoCAPIError:
+        war_data, is_cwl = await get_active_war_for_chat_cached()
+    except Exception:
         return random.choice(RESPONSES_WAR_STARTED_NO)
-    
+
     if not war_data:
         return random.choice(RESPONSES_WAR_STARTED_NO)
-    
+
     state = war_data.get("state")
-    
+    cwl_day = war_data.get("_cwl_day") if is_cwl else None
+
     if state == "notInWar":
         return random.choice(RESPONSES_WAR_STARTED_NO)
     elif state == "preparation":
+        if is_cwl and cwl_day:
+            return random.choice(RESPONSES_CWL_PREP).format(day=cwl_day)
         return random.choice(RESPONSES_WAR_STARTED_PREP)
     elif state == "inWar":
+        if is_cwl and cwl_day:
+            return random.choice(RESPONSES_CWL_INWAR).format(day=cwl_day)
         return random.choice(RESPONSES_WAR_STARTED_YES)
     elif state == "warEnded":
+        if is_cwl and cwl_day:
+            # Day 7 ended → CWL season is over, fall back to regular ended phrasing
+            if cwl_day >= 7:
+                return random.choice(RESPONSES_WAR_STARTED_ENDED)
+            return random.choice(RESPONSES_CWL_DAY_ENDED).format(
+                day=cwl_day,
+                result_summary="Next day starts soon."
+            )
         return random.choice(RESPONSES_WAR_STARTED_ENDED)
     else:
         return random.choice(RESPONSES_WAR_STARTED_NO)
-
 
 RESPONSES_WAR_ENDED_WIN = [
     "War's over. We won. Try not to let it go to your head.",
@@ -658,6 +988,11 @@ RESPONSES_WAR_ENDED_WIN = [
     "We won. The enemy is writing angry Reddit posts about us.",
     "Last war was a W. Your mom would be proud. Maybe.",
     "Won that one. The winning streak is at... 1. Let's keep it going.",
+    "That's a W in the books. Well earned. Maybe.",
+    "Last war: victory. The clan delivered when it mattered.",
+    "Won it. Clean or messy, doesn't matter. Won it.",
+    "We took that. The enemy is drafting their resignation.",
+    "Victory secured. Now don't blow the next one.",
 ]
 
 RESPONSES_WAR_ENDED_LOSS = [
@@ -676,49 +1011,88 @@ RESPONSES_WAR_ENDED_LOSS = [
     "We lost. The clan castle is in mourning.",
     "Defeat in the books. Your enemies send their regards.",
     "That war? We don't talk about that war.",
+    "Last war was an L. Respect to the enemy, I guess.",
+    "We lost that one. It happens. Shouldn't, but it does.",
+    "Defeat. Time to learn and move on. Mostly move on.",
+    "Lost it. The enemy was simply better today. Allegedly.",
+    "That war didn't go our way. Next one will. It has to.",
 ]
 
-
 async def get_sassy_war_response() -> str:
-    """Get a sassy response based on current war status"""
+    """Get a sassy response based on current war status (CWL-aware)"""
     try:
-        war_data = await bot.coc.get_current_war(config.CLAN_TAG)
-    except CoCAPIError:
+        war_data, is_cwl = await get_active_war_for_chat_cached()
+    except Exception:
         return random.choice(RESPONSES_NOT_IN_WAR)
-    
+
     if not war_data:
         return random.choice(RESPONSES_NOT_IN_WAR)
-    
+
     state = war_data.get("state")
-    
+    cwl_day = war_data.get("_cwl_day") if is_cwl else None
+
     if state == "notInWar":
         return random.choice(RESPONSES_NOT_IN_WAR)
-    
+
     if state == "preparation":
+        if is_cwl and cwl_day:
+            return random.choice(RESPONSES_CWL_PREP).format(day=cwl_day)
         return random.choice(RESPONSES_PREPARATION)
-    
+
     # Get scores
     clan = war_data.get("clan", {})
     opponent = war_data.get("opponent", {})
-    
+
     clan_stars = clan.get("stars", 0)
     opponent_stars = opponent.get("stars", 0)
     clan_destruction = clan.get("destructionPercentage", 0)
     opponent_destruction = opponent.get("destructionPercentage", 0)
-    
+
     star_diff = clan_stars - opponent_stars
     dest_diff = clan_destruction - opponent_destruction
-    
+
     # War ended - return result
     if state == "warEnded":
+        if is_cwl and cwl_day and cwl_day < 7:
+            # Mid-CWL day ended (between days)
+            if star_diff > 0 or (star_diff == 0 and dest_diff > 0):
+                summary = f"We took Day {cwl_day} ({clan_stars}⭐ vs {opponent_stars}⭐)."
+            elif star_diff < 0 or (star_diff == 0 and dest_diff < 0):
+                summary = f"We dropped Day {cwl_day} ({clan_stars}⭐ vs {opponent_stars}⭐)."
+            else:
+                summary = f"Day {cwl_day} ended in a draw ({clan_stars}⭐ each)."
+            return random.choice(RESPONSES_CWL_DAY_ENDED).format(day=cwl_day, result_summary=summary)
+
         if star_diff > 0 or (star_diff == 0 and dest_diff > 0):
             return random.choice(RESPONSES_WAR_ENDED_WIN)
         elif star_diff < 0 or (star_diff == 0 and dest_diff < 0):
             return random.choice(RESPONSES_WAR_ENDED_LOSS)
         else:
             return "War ended in a perfect tie. What are the odds?"
-    
-    # In war - check scores
+
+    # In war (inWar) — pick CWL-flavored or regular response based on score
+    if is_cwl and cwl_day:
+        if star_diff == 0:
+            if abs(dest_diff) < 5:
+                return random.choice(RESPONSES_CWL_TIED).format(day=cwl_day)
+            elif dest_diff > 0:
+                return random.choice(RESPONSES_CWL_WIN_CLOSE).format(day=cwl_day)
+            else:
+                return random.choice(RESPONSES_CWL_LOSE_CLOSE).format(day=cwl_day)
+        elif star_diff >= 10:
+            return random.choice(RESPONSES_CWL_WIN_BIG).format(day=cwl_day)
+        elif star_diff >= 3:
+            return random.choice(RESPONSES_CWL_WIN_CLOSE).format(day=cwl_day)
+        elif star_diff <= -10:
+            return random.choice(RESPONSES_CWL_LOSE_BIG).format(day=cwl_day)
+        elif star_diff <= -3:
+            return random.choice(RESPONSES_CWL_LOSE_CLOSE).format(day=cwl_day)
+        elif star_diff > 0:
+            return random.choice(RESPONSES_CWL_WIN_CLOSE).format(day=cwl_day)
+        else:
+            return random.choice(RESPONSES_CWL_LOSE_CLOSE).format(day=cwl_day)
+
+    # Regular war
     if star_diff == 0:
         if abs(dest_diff) < 5:
             return random.choice(RESPONSES_TIED)
@@ -739,6 +1113,336 @@ async def get_sassy_war_response() -> str:
     else:
         return random.choice(RESPONSES_LOSING_CLOSE)
 
+async def get_pushback_response() -> str:
+    """Respond to a user pushing back on the bot's war-status answer.
+
+    Re-checks war state and either acknowledges the user is right or
+    doubles down that they're wrong.
+    """
+    try:
+        war_data, is_cwl = await get_active_war_for_chat_cached()
+    except Exception:
+        return random.choice(RESPONSES_PUSHBACK_INWAR_FALSE)
+
+    if not war_data:
+        return random.choice(RESPONSES_PUSHBACK_INWAR_FALSE)
+
+    state = war_data.get("state")
+    if state in ["preparation", "inWar", "warEnded"]:
+        return random.choice(RESPONSES_PUSHBACK_INWAR_TRUE)
+    return random.choice(RESPONSES_PUSHBACK_INWAR_FALSE)
+
+def _format_member_link_info(player_tag: str, speaker_account_tags: set) -> str:
+    """Return a short ", linked to Discord: X" / ", unlinked" annotation
+    for the war-context block, plus a self-flag if the speaker owns this
+    account. Best-effort — silent on DB errors."""
+    if not player_tag:
+        return ""
+    try:
+        linked_ids = db.get_discord_ids_for_account(player_tag)
+    except Exception:
+        return ""
+    tag_upper = player_tag.upper() if player_tag.startswith("#") else f"#{player_tag.upper()}"
+    is_speaker = tag_upper in speaker_account_tags
+    if not linked_ids:
+        return ", unlinked"
+    names = []
+    for did in linked_ids:
+        try:
+            user = db.get_discord_user(did)
+            if user and user.get("discord_name"):
+                names.append(user["discord_name"])
+        except Exception:
+            continue
+    if names:
+        suffix = f", linked to Discord: {', '.join(names)}"
+    else:
+        suffix = ", linked"
+    if is_speaker:
+        suffix += " — THIS IS THE SPEAKER'S OWN ACCOUNT"
+    return suffix
+
+# Lightweight cache for the chat-side war fetch. War state changes slowly
+# (the monitor polls every 2 min). Caching the heavy fetch — which makes
+# multiple CoC API calls per chat message — for 60s prevents @-mentions
+# from queuing behind 8 HTTP calls when a clan is in CWL.
+_chat_war_cache: dict = {"data": None, "is_cwl": False, "ts": 0.0}
+_CHAT_WAR_CACHE_TTL = 60.0  # seconds
+
+# Per-player TH/hero cache so we can answer "what about Gunny?" without
+# hitting CoC API on every chat message. Player TH changes rarely (an
+# upgrade takes weeks), so 1h TTL is plenty conservative.
+_player_meta_cache: dict = {}  # player_tag -> (data_dict, ts)
+_PLAYER_META_TTL = 3600.0
+
+async def _fetch_player_meta_cached(player_tag: str) -> Optional[dict]:
+    """Fetch a player's TH + hero info, cached for 1h. Returns None on error."""
+    import time
+    if not player_tag:
+        return None
+    now = time.monotonic()
+    cached = _player_meta_cache.get(player_tag)
+    if cached and (now - cached[1]) < _PLAYER_META_TTL:
+        return cached[0]
+    try:
+        data = await bot.coc.get_player(player_tag)
+    except Exception as e:
+        log.debug(f"Player meta fetch failed for {player_tag}: {e}")
+        return None
+    if data:
+        _player_meta_cache[player_tag] = (data, now)
+    return data
+
+def _strip_decorations(name: str) -> str:
+    """Bare letters+digits, lowercase. For clan-name matching."""
+    if not name:
+        return ""
+    return re.sub(r'[^A-Za-z0-9]', '', name).lower()
+
+async def _resolve_mentioned_clan_members(content: str, message: discord.Message) -> list[dict]:
+    """Find clan members referenced in the chat message and resolve their
+    linked CoC account info (TH + key hero levels).
+
+    Detects:
+      1. Explicit Discord @-mentions (highest signal)
+      2. Free-text occurrences of a known clan member's Discord display_name
+         OR linked CoC player_name (min 4 chars, whole-word match)
+
+    Returns a list of {discord_name, coc_name, th, heroes_summary}, capped
+    at 5 entries to keep the LLM context tight.
+    """
+    mentioned: list[dict] = []
+    seen_tags: set[str] = set()
+
+    async def _add_for_discord_id(discord_id: str, mention_source: str):
+        """Resolve a Discord user's linked CoC accounts and append entries."""
+        try:
+            accounts = db.get_accounts_for_discord_user(str(discord_id))
+        except Exception:
+            return
+        for acc in accounts:
+            tag = acc.get("player_tag", "")
+            if not tag or tag in seen_tags:
+                continue
+            seen_tags.add(tag)
+            data = await _fetch_player_meta_cached(tag)
+            if not data:
+                continue
+            heroes = [(h.get("name", "?"), h.get("level", 0)) for h in data.get("heroes", [])]
+            heroes_summary = ", ".join(f"{n} lvl {l}" for n, l in heroes[:6]) if heroes else "no heroes"
+            mentioned.append({
+                "mention_source": mention_source,
+                "discord_name": mention_source if mention_source.startswith("@") else "",
+                "coc_name": data.get("name", acc.get("player_name", "?")),
+                "player_tag": tag,
+                "th": data.get("townHallLevel"),
+                "heroes_summary": heroes_summary,
+                "trophies": data.get("trophies"),
+            })
+            if len(mentioned) >= 5:
+                return
+
+    # 1. Explicit Discord @-mentions in the message
+    for user in message.mentions:
+        if user.bot:
+            continue
+        await _add_for_discord_id(user.id, f"@{user.name}")
+        if len(mentioned) >= 5:
+            return mentioned
+
+    # 2. Free-text name matches against known linked clanmates
+    try:
+        all_links = db.get_all_links()
+    except Exception:
+        all_links = []
+
+    content_lower = content.lower()
+    for link in all_links:
+        tag = link.get("player_tag", "")
+        if not tag or tag in seen_tags:
+            continue
+        coc_name = link.get("player_name", "") or ""
+        discord_name = link.get("discord_name", "") or ""
+        # Try the bare-name "core" of each as a whole-word match
+        for raw_name in (coc_name, discord_name):
+            core = _strip_decorations(raw_name)
+            if len(core) < 4:
+                continue
+            if re.search(rf'\b{re.escape(core)}\b', content_lower):
+                seen_tags.add(tag)
+                discord_id = link.get("discord_id", "")
+                if discord_id:
+                    await _add_for_discord_id(discord_id, raw_name)
+                if len(mentioned) >= 5:
+                    return mentioned
+                break  # don't match the same player twice via different name
+
+    return mentioned
+
+async def get_active_war_for_chat_cached() -> tuple[Optional[dict], bool]:
+    """Cached wrapper around get_active_war_for_chat — TTL ~60s."""
+    import time
+    now = time.monotonic()
+    if _chat_war_cache["data"] is not None and (now - _chat_war_cache["ts"]) < _CHAT_WAR_CACHE_TTL:
+        return _chat_war_cache["data"], _chat_war_cache["is_cwl"]
+    data, is_cwl = await get_active_war_for_chat()
+    _chat_war_cache["data"] = data
+    _chat_war_cache["is_cwl"] = is_cwl
+    _chat_war_cache["ts"] = now
+    return data, is_cwl
+
+def _resolve_favorite_member() -> Optional[discord.Member]:
+    """Find the configured favorite user in any joined guild. Returns the
+    Member object (so we can format a real mention) or None if not found."""
+    target = (config.FAVORITE_DISCORD_USERNAME or "").lower()
+    if not target:
+        return None
+    for guild in bot.guilds:
+        for member in guild.members:
+            if (member.name or "").lower() == target:
+                return member
+            if (member.display_name or "").lower() == target:
+                return member
+    return None
+
+async def build_war_context_for_llm(
+    speaker_discord_id: str = "",
+    mentioned_players: Optional[list[dict]] = None,
+) -> str:
+    """Compact war-state snapshot injected into the LLM system prompt so the
+    model can speak factually without being able to invent stats. Includes
+    per-member attack results AND linked-Discord status so name-specific
+    questions ("did pr8a attack?") can be answered from data and disambiguated
+    via the link table when names are similar (e.g. pr7a alt vs pr8a friend)."""
+    try:
+        war_data, is_cwl = await get_active_war_for_chat_cached()
+    except Exception:
+        return "No active war or CWL data available right now."
+
+    if not war_data:
+        return "No active war or CWL right now."
+
+    state = war_data.get("state", "unknown")
+    clan = war_data.get("clan", {})
+    opponent = war_data.get("opponent", {})
+    cwl_day = war_data.get("_cwl_day") if is_cwl else None
+    team_size = war_data.get("teamSize", 0)
+
+    # Resolve speaker's own linked CoC accounts so we can flag self-queries
+    speaker_account_tags = set()
+    if speaker_discord_id:
+        try:
+            for acc in db.get_accounts_for_discord_user(speaker_discord_id):
+                tag = acc.get("player_tag", "")
+                if tag:
+                    speaker_account_tags.add(tag.upper() if tag.startswith("#") else f"#{tag.upper()}")
+        except Exception:
+            pass
+
+    lines = []
+    if is_cwl and cwl_day:
+        lines.append(f"Currently in CWL Day {cwl_day} of 7.")
+    elif is_cwl:
+        lines.append("Currently in CWL.")
+    else:
+        lines.append("Currently in a regular clan war.")
+
+    lines.append(f"Opponent clan: {opponent.get('name', '?')}")
+    lines.append(f"State: {state}")
+
+    if speaker_account_tags:
+        lines.append(
+            f"The speaker is linked to {len(speaker_account_tags)} CoC account(s) in this clan."
+        )
+
+    # Inject the bot's hardcoded favorite — used by the LLM as a positive
+    # reference point and (rarely) @-pinged in roasts.
+    favorite = _resolve_favorite_member()
+    if favorite:
+        # Use the bare username (not display_name) so the LLM gets the literal
+        # handle to reproduce verbatim. Wrap in backticks as a visual signal
+        # that this is a token, not a sentence.
+        favorite_handle = favorite.name
+        is_self = str(favorite.id) == str(speaker_discord_id)
+        if is_self:
+            lines.append(
+                f"FAVORITE CLAN MEMBER (literal handle, copy verbatim — DO NOT split into words): "
+                f"`{favorite_handle}` — and that is exactly who is speaking right now. "
+                f"Be warm, defer to them, never roast them."
+            )
+        else:
+            lines.append(
+                f"FAVORITE CLAN MEMBER (literal handle, copy verbatim — DO NOT split into words): "
+                f"`{favorite_handle}` — write it exactly as shown. Never ping them unprompted. Never confuse them with Gunny."
+            )
+
+    if state in ("inWar", "warEnded"):
+        lines.append(
+            f"Score: {clan.get('stars', 0)} stars, {clan.get('destructionPercentage', 0):.1f}% "
+            f"vs opponent {opponent.get('stars', 0)} stars, {opponent.get('destructionPercentage', 0):.1f}%"
+        )
+
+        members = clan.get("members", [])
+        attacks_per = 1 if is_cwl else 2
+
+        attacked_lines = []
+        partial_lines = []
+        not_attacked_lines = []
+        total_used = 0
+
+        for m in members:
+            name = m.get("name", "?")
+            tag = m.get("tag", "")
+            th = m.get("townhallLevel", "?")
+            attacks = m.get("attacks", [])
+            used = len(attacks)
+            total_used += used
+            link_info = _format_member_link_info(tag, speaker_account_tags)
+
+            if used >= attacks_per:
+                stars = sum(a.get("stars", 0) for a in attacks)
+                dest_avg = sum(a.get("destructionPercentage", 0) for a in attacks) / used
+                attacked_lines.append(f"{name} (TH{th}, {stars}★ {dest_avg:.0f}%{link_info})")
+            elif used > 0:
+                stars = sum(a.get("stars", 0) for a in attacks)
+                partial_lines.append(
+                    f"{name} (TH{th}, {used}/{attacks_per} done, {stars}★{link_info})"
+                )
+            else:
+                not_attacked_lines.append(f"{name} (TH{th}{link_info})")
+
+        max_attacks = team_size * attacks_per
+        lines.append(f"Attacks used: {total_used}/{max_attacks}")
+
+        if attacked_lines:
+            lines.append("Players who fully used their attacks: " + ", ".join(attacked_lines))
+        if partial_lines:
+            lines.append("Players with partial attacks done: " + ", ".join(partial_lines))
+        if not_attacked_lines:
+            lines.append("Players who have NOT attacked yet: " + ", ".join(not_attacked_lines))
+
+    # MENTIONED PLAYERS — populated when the chat message references a clan
+    # member by Discord @-mention or by a known display/CoC name. This is the
+    # ONLY authoritative source the LLM has for TH/heroes of clanmates who
+    # may not be in the current war roster (e.g. sitting out CWL). The prompt
+    # forbids inventing TH levels, so without this block the bot must say it
+    # doesn't know.
+    if mentioned_players:
+        m_lines = []
+        for m in mentioned_players:
+            th = m.get("th")
+            th_str = f"TH{th}" if th else "TH unknown"
+            heroes = m.get("heroes_summary", "")
+            coc_name = m.get("coc_name", "?")
+            discord_name = m.get("discord_name") or m.get("mention_source", "")
+            tag = m.get("player_tag", "")
+            who = f"{discord_name} (CoC: {coc_name}{', tag ' + tag if tag else ''})" if discord_name else f"CoC: {coc_name}"
+            m_lines.append(f"{who} — {th_str}, heroes: {heroes}")
+        lines.append("MENTIONED PLAYERS (use this for any TH/hero stats about these players — do not invent any others):")
+        for ml in m_lines:
+            lines.append(f"  - {ml}")
+
+    return "\n".join(lines)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -761,48 +1465,155 @@ async def on_message(message: discord.Message):
         await message.reply(response, mention_author=False)
         return
     
-    # Check patterns in priority order
-    if check_pattern_match(content, WAR_STARTED_PATTERNS):
+    chat_ai_enabled = db.get_config("chat_ai_enabled") == "1"
+
+    # Factual paths always stay deterministic — they trigger real API/DB
+    # lookups and the user expects accurate info, not creative writing.
+    if check_pattern_match(content, USER_IN_WAR_CLAIM_PATTERNS):
+        response = await get_pushback_response()
+    elif check_pattern_match(content, WAR_STARTED_PATTERNS):
         response = await get_war_started_response()
     elif check_pattern_match(content, WAR_STATUS_PATTERNS):
         response = await get_sassy_war_response()
-    elif check_pattern_match(content, INSULT_PATTERNS):
-        response = random.choice(RESPONSES_INSULT)
-    elif check_pattern_match(content, COMPLIMENT_PATTERNS):
-        response = random.choice(RESPONSES_COMPLIMENT)
-    elif check_pattern_match(content, IDENTITY_PATTERNS):
-        response = random.choice(RESPONSES_IDENTITY)
-    elif check_pattern_match(content, GREETING_PATTERNS):
-        response = random.choice(RESPONSES_GREETING)
-    else:
-        # Didn't match anything specific - give confused response or war status
-        if random.random() < 0.3:
-            response = random.choice(RESPONSES_CONFUSED)
+    # Hard refusal pre-filter — never lets an off-scope ask reach the model
+    elif chat_ai_enabled and check_pattern_match(content, OFF_SCOPE_PATTERNS):
+        response = random.choice(RESPONSES_OFF_SCOPE)
+    elif chat_ai_enabled:
+        # Everything else — greetings, insults, compliments, identity asks,
+        # general chitchat — goes to the LLM for dynamic, in-character replies.
+        llm_reply = None
+        try:
+            async with message.channel.typing():
+                # Resolve clan members referenced in the message so we have
+                # authoritative TH/hero data for them (no model speculation).
+                mentioned = await _resolve_mentioned_clan_members(content, message)
+                war_context = await build_war_context_for_llm(
+                    speaker_discord_id=str(message.author.id),
+                    mentioned_players=mentioned,
+                )
+                llm_reply = await llm.generate_chat_response(
+                    user_message=content,
+                    user_id=str(message.author.id),
+                    user_name=message.author.display_name,
+                    channel_id=str(message.channel.id),
+                    war_context=war_context,
+                )
+        except Exception as e:
+            log.error(f"LLM fallback failed: {e}")
+
+        if llm_reply:
+            response = llm_reply
         else:
-            # Default to war status with a prefix
-            prefix = random.choice([
-                "Not sure what you mean, but here's the war status: ",
-                "I'll pretend that was a war question. ",
-                "Whatever. Anyway, ",
-                "Okay? Anyway, war update: ",
-                "Sure. Meanwhile, ",
-            ])
-            war_response = await get_sassy_war_response()
-            response = prefix + war_response
-    
+            # LLM unavailable — degrade gracefully to the old static behavior
+            response = await _static_fallback_response(content)
+    else:
+        # Toggle off — original deterministic behavior across all unmatched cases
+        response = await _static_fallback_response(content)
+
     await message.reply(response, mention_author=False)
     await bot.process_commands(message)
 
+async def _static_fallback_response(content: str) -> str:
+    """Pre-LLM behavior. Used when AI is off, or as graceful fallback
+    if the LLM is unreachable / times out."""
+    if check_pattern_match(content, INSULT_PATTERNS):
+        return random.choice(RESPONSES_INSULT)
+    if check_pattern_match(content, COMPLIMENT_PATTERNS):
+        return random.choice(RESPONSES_COMPLIMENT)
+    if check_pattern_match(content, IDENTITY_PATTERNS):
+        return random.choice(RESPONSES_IDENTITY)
+    if check_pattern_match(content, GREETING_PATTERNS):
+        return random.choice(RESPONSES_GREETING)
+    if random.random() < 0.3:
+        return random.choice(RESPONSES_CONFUSED)
+    prefix = random.choice([
+        "Not sure what you mean, but here's the war status: ",
+        "I'll pretend that was a war question. ",
+        "Whatever. Anyway, ",
+        "Okay? Anyway, war update: ",
+        "Sure. Meanwhile, ",
+    ])
+    return prefix + await get_sassy_war_response()
 
-# ============================================================
 # General Commands
-# ============================================================
 
 @bot.tree.command(name="ping", description="Check if bot is alive")
-async def ping_command(interaction: discord.Interaction):
+@app_commands.describe(show="Show message publicly in channel")
+async def ping_command(interaction: discord.Interaction, show: bool = False):
     latency = round(bot.latency * 1000)
-    await interaction.response.send_message(f"Pong! {latency}ms")
+    await interaction.response.send_message(f"Pong! {latency}ms", ephemeral=not show)
 
+@bot.tree.command(name="chat-ai", description="[Beta] Toggle AI conversational fallback")
+@app_commands.describe(mode="on, off, or status")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="status", value="status"),
+])
+async def chat_ai_command(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    # Authorization: only the configured beta user.
+    # Modern Discord usernames are lowercase, so compare case-insensitively
+    # against the bare username (interaction.user.name) and the user ID
+    # (BETA_TOGGLE_USER_ID — set via env if you want unambiguous matching).
+    expected_name = config.BETA_TOGGLE_USERNAME.lower()
+    actual_name = (interaction.user.name or "").lower()
+    expected_id = getattr(config, "BETA_TOGGLE_USER_ID", "") or ""
+    actual_id = str(interaction.user.id)
+
+    authorized = (actual_name == expected_name) or (expected_id and actual_id == expected_id)
+    if not authorized:
+        await interaction.response.send_message(
+            f"This is a beta toggle. Only the bot owner can flip it. "
+            f"(your username: `{interaction.user.name}`, id: `{actual_id}`)",
+            ephemeral=True,
+        )
+        return
+
+    choice = mode.value
+
+    if choice == "status":
+        current = db.get_config("chat_ai_enabled") == "1"
+        ollama_up = await llm.is_ollama_up()
+        model_ready = await llm.is_model_ready() if ollama_up else False
+        msg = (
+            f"**Chat AI:** {'ON' if current else 'OFF'}\n"
+            f"**Ollama service:** {'reachable' if ollama_up else 'unreachable'}\n"
+            f"**Model `{config.OLLAMA_MODEL}`:** {'ready' if model_ready else 'not pulled'}"
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    new_val = choice == "on"
+
+    if new_val:
+        await interaction.response.defer(ephemeral=True)
+        if not await llm.is_ollama_up():
+            await interaction.followup.send(
+                "Can't reach Ollama service. Won't enable until it's up.\n"
+                "Check that the `ollama` container is running.",
+                ephemeral=True,
+            )
+            return
+        if not await llm.is_model_ready():
+            await interaction.followup.send(
+                f"Ollama is up but model `{config.OLLAMA_MODEL}` isn't pulled yet. "
+                f"Run `docker exec coc-war-ollama ollama pull {config.OLLAMA_MODEL}` first, "
+                f"then try again.",
+                ephemeral=True,
+            )
+            return
+        db.set_config("chat_ai_enabled", "1")
+        await interaction.followup.send(
+            "Chat AI is now **ON** (beta). Affects only the conversational fallback path — "
+            "deterministic war/CWL responses are unchanged.",
+            ephemeral=True,
+        )
+    else:
+        db.set_config("chat_ai_enabled", "0")
+        await interaction.response.send_message(
+            "Chat AI is now **OFF**. Falling back to the static response pool.",
+            ephemeral=True,
+        )
 
 @bot.tree.command(name="help", description="Show all available commands")
 @app_commands.describe(show="Show message publicly in channel")
@@ -817,37 +1628,35 @@ async def help_command(interaction: discord.Interaction, show: bool = False):
 `/ping` - Check if bot is online
 `/clan` - Show clan info
 `/war` - Show current war status
-`/cwl` - Show CWL status and standings
+`/cwl` - Show CWL standings
+`/tags` - Show clan roster with player tags
 
-Add `show:True` to display publicly (e.g. `/war show:True`)"""
+All commands are private by default. Add `show:True` to post publicly (e.g. `/war show:True`)"""
     embed.add_field(name="General", value=general, inline=False)
-    
+
     linking = """`/link <tag>` - Link your CoC account
 `/unlink <tag>` - Remove a link
 `/myaccounts` - Show your linked accounts
 `/whois <tag>` - See who's linked to an account"""
     embed.add_field(name="Account Linking", value=linking, inline=False)
-    
+
     # Check if user is admin or co-leader
     is_admin = interaction.user.guild_permissions.administrator
     is_coleader = any(role.name.lower() == "co-leader" for role in interaction.user.roles)
-    
+
     if is_admin or is_coleader:
         admin = """`/forcelink @user <tag>` - Link for someone else
 `/forceunlink <tag> [@user]` - Remove links
-`/links` - Show all links
-`/tags` - Shows clan roster with player tags
-`/cwl stats` - CWL individual performance
-`/showconfig` - View settings"""
+`/links` - Show all account links
+`/cwlstats` - CWL individual performance"""
         embed.add_field(name="Admin", value=admin, inline=False)
     
-    embed.set_footer(text="Reminders at 8h, 4h, 2h, 1h before war ends")
     await interaction.response.send_message(embed=embed, ephemeral=not show)
 
-
 @bot.tree.command(name="clan", description="Show clan information")
-async def clan_command(interaction: discord.Interaction):
-    if not await safe_defer(interaction):
+@app_commands.describe(show="Show message publicly in channel")
+async def clan_command(interaction: discord.Interaction, show: bool = False):
+    if not await safe_defer(interaction, ephemeral=not show):
         return
     
     try:
@@ -873,7 +1682,6 @@ async def clan_command(interaction: discord.Interaction):
         embed.set_thumbnail(url=clan_data["badgeUrls"]["medium"])
     
     await interaction.followup.send(embed=embed)
-
 
 @bot.tree.command(name="war", description="Show current war status")
 @app_commands.describe(show="Show message publicly in channel")
@@ -1038,15 +1846,12 @@ async def war_command(interaction: discord.Interaction, show: bool = False):
     
     await interaction.followup.send(embed=embed)
 
-
-# ============================================================
 # Linking Commands
-# ============================================================
 
 @bot.tree.command(name="link", description="Link your Discord to a CoC account")
-@app_commands.describe(player_tag="Your player tag (e.g. #ABC123)")
-async def link_command(interaction: discord.Interaction, player_tag: str):
-    if not await safe_defer(interaction):
+@app_commands.describe(player_tag="Your player tag (e.g. #ABC123)", show="Show message publicly in channel")
+async def link_command(interaction: discord.Interaction, player_tag: str, show: bool = False):
+    if not await safe_defer(interaction, ephemeral=not show):
         return
     
     if not player_tag.startswith("#"):
@@ -1074,73 +1879,68 @@ async def link_command(interaction: discord.Interaction, player_tag: str):
     else:
         await interaction.followup.send(f"Already linked to **{player_name}** (`{player_tag}`).")
 
-
 @bot.tree.command(name="unlink", description="Unlink a CoC account from your Discord")
-@app_commands.describe(player_tag="The player tag to unlink")
-async def unlink_command(interaction: discord.Interaction, player_tag: str):
+@app_commands.describe(player_tag="The player tag to unlink", show="Show message publicly in channel")
+async def unlink_command(interaction: discord.Interaction, player_tag: str, show: bool = False):
     if not player_tag.startswith("#"):
         player_tag = f"#{player_tag}"
     player_tag = player_tag.upper()
-    
+
     removed = db.unlink_account(player_tag, str(interaction.user.id))
-    
+
     if removed:
         log.info(f"{interaction.user.name} unlinked from {player_tag}")
-        await interaction.response.send_message(f"Unlinked `{player_tag}` from your account.")
+        await interaction.response.send_message(f"Unlinked `{player_tag}` from your account.", ephemeral=not show)
     else:
-        await interaction.response.send_message(f"You don't have `{player_tag}` linked.")
-
+        await interaction.response.send_message(f"You don't have `{player_tag}` linked.", ephemeral=not show)
 
 @bot.tree.command(name="myaccounts", description="Show your linked CoC accounts")
-async def myaccounts_command(interaction: discord.Interaction):
+@app_commands.describe(show="Show message publicly in channel")
+async def myaccounts_command(interaction: discord.Interaction, show: bool = False):
     accounts = db.get_accounts_for_discord_user(str(interaction.user.id))
-    
+
     if not accounts:
-        await interaction.response.send_message("No linked accounts. Use `/link #YourTag` to link.")
+        await interaction.response.send_message("No linked accounts. Use `/link #YourTag` to link.", ephemeral=not show)
         return
-    
+
     lines = [f"**{a['player_name']}** `{a['player_tag']}`" for a in accounts]
-    
+
     embed = discord.Embed(
         title=f"{interaction.user.display_name}'s Accounts",
         description="\n".join(lines),
         color=discord.Color.blue()
     )
-    
-    await interaction.response.send_message(embed=embed)
 
+    await interaction.response.send_message(embed=embed, ephemeral=not show)
 
 @bot.tree.command(name="whois", description="Show who is linked to a CoC account")
-@app_commands.describe(player_tag="The player tag to look up")
-async def whois_command(interaction: discord.Interaction, player_tag: str):
+@app_commands.describe(player_tag="The player tag to look up", show="Show message publicly in channel")
+async def whois_command(interaction: discord.Interaction, player_tag: str, show: bool = False):
     if not player_tag.startswith("#"):
         player_tag = f"#{player_tag}"
     player_tag = player_tag.upper()
-    
+
     account = db.get_coc_account(player_tag)
     if not account:
-        await interaction.response.send_message(f"No account found for `{player_tag}`")
+        await interaction.response.send_message(f"No account found for `{player_tag}`", ephemeral=not show)
         return
-    
+
     discord_ids = db.get_discord_ids_for_account(player_tag)
-    
+
     if not discord_ids:
-        await interaction.response.send_message(f"**{account['player_name']}** `{player_tag}` - not linked")
+        await interaction.response.send_message(f"**{account['player_name']}** `{player_tag}` - not linked", ephemeral=not show)
         return
-    
+
     mentions = [f"<@{did}>" for did in discord_ids]
-    await interaction.response.send_message(f"**{account['player_name']}** `{player_tag}` → {', '.join(mentions)}")
+    await interaction.response.send_message(f"**{account['player_name']}** `{player_tag}` → {', '.join(mentions)}", ephemeral=not show)
 
-
-# ============================================================
 # Admin Commands
-# ============================================================
 
 @bot.tree.command(name="forcelink", description="[Admin] Link a CoC account to a Discord user")
-@app_commands.describe(user="The Discord user", player_tag="The player tag")
+@app_commands.describe(user="The Discord user", player_tag="The player tag", show="Show message publicly in channel")
 @is_admin_or_coleader()
-async def forcelink_command(interaction: discord.Interaction, user: discord.Member, player_tag: str):
-    if not await safe_defer(interaction):
+async def forcelink_command(interaction: discord.Interaction, user: discord.Member, player_tag: str, show: bool = False):
+    if not await safe_defer(interaction, ephemeral=not show):
         return
     
     if not player_tag.startswith("#"):
@@ -1168,38 +1968,37 @@ async def forcelink_command(interaction: discord.Interaction, user: discord.Memb
     else:
         await interaction.followup.send(f"{user.mention} already linked to **{player_name}**")
 
-
 @bot.tree.command(name="forceunlink", description="[Admin] Unlink a CoC account")
-@app_commands.describe(player_tag="The player tag", user="Specific user to unlink (optional)")
+@app_commands.describe(player_tag="The player tag", user="Specific user to unlink (optional)", show="Show message publicly in channel")
 @is_admin_or_coleader()
-async def forceunlink_command(interaction: discord.Interaction, player_tag: str, user: discord.Member = None):
+async def forceunlink_command(interaction: discord.Interaction, player_tag: str, user: discord.Member = None, show: bool = False):
     if not player_tag.startswith("#"):
         player_tag = f"#{player_tag}"
     player_tag = player_tag.upper()
-    
+
     if user:
         removed = db.unlink_account(player_tag, str(user.id))
         if removed:
             log.info(f"{interaction.user.name} force-unlinked {user.name} from {player_tag}")
-            await interaction.response.send_message(f"Unlinked `{player_tag}` from {user.mention}")
+            await interaction.response.send_message(f"Unlinked `{player_tag}` from {user.mention}", ephemeral=not show)
         else:
-            await interaction.response.send_message(f"{user.mention} wasn't linked to `{player_tag}`")
+            await interaction.response.send_message(f"{user.mention} wasn't linked to `{player_tag}`", ephemeral=not show)
     else:
         count = db.unlink_all_from_account(player_tag)
         if count > 0:
             log.info(f"{interaction.user.name} force-unlinked all ({count}) from {player_tag}")
-            await interaction.response.send_message(f"Removed {count} link(s) from `{player_tag}`")
+            await interaction.response.send_message(f"Removed {count} link(s) from `{player_tag}`", ephemeral=not show)
         else:
-            await interaction.response.send_message(f"No links found for `{player_tag}`")
-
+            await interaction.response.send_message(f"No links found for `{player_tag}`", ephemeral=not show)
 
 @bot.tree.command(name="links", description="[Admin] Show all account links")
+@app_commands.describe(show="Show message publicly in channel")
 @is_admin_or_coleader()
-async def links_command(interaction: discord.Interaction):
+async def links_command(interaction: discord.Interaction, show: bool = False):
     all_links = db.get_all_links()
     
     if not all_links:
-        await interaction.response.send_message("No account links in database.")
+        await interaction.response.send_message("No account links in database.", ephemeral=not show)
         return
     
     by_player = defaultdict(list)
@@ -1217,13 +2016,10 @@ async def links_command(interaction: discord.Interaction):
     else:
         embed.description = content[:4000]
     
-    embed.set_footer(text=f"{len(all_links)} link(s), {len(by_player)} account(s)")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=not show)
 
-
-@bot.tree.command(name="tags", description="[Admin] Shows clan roster with player tags")
+@bot.tree.command(name="tags", description="Shows clan roster with player tags")
 @app_commands.describe(show="Show message publicly in channel")
-@is_admin_or_coleader()
 async def tags_command(interaction: discord.Interaction, show: bool = False):
     if not await safe_defer(interaction, ephemeral=not show):
         return
@@ -1293,24 +2089,7 @@ async def tags_command(interaction: discord.Interaction, show: bool = False):
     log.info(f"Synced {len(members)} members, {len(unlinked)} unlinked")
     await interaction.followup.send(embed=embed)
 
-
-@bot.tree.command(name="showconfig", description="[Admin] View bot configuration")
-@is_admin_or_coleader()
-async def showconfig_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="Bot Configuration", color=discord.Color.blue())
-    
-    embed.add_field(name="Clan", value=f"`{config.CLAN_TAG}`", inline=True)
-    embed.add_field(name="Reminder Channel", value=f"<#{config.REMINDER_CHANNEL_ID}>", inline=True)
-    embed.add_field(name="Welcome Channel", value=f"<#{config.WELCOME_CHANNEL_ID}>", inline=True)
-    embed.add_field(name="Co-leader Channel", value=f"<#{config.COLEADER_CHANNEL_ID}>", inline=True)
-    embed.add_field(name="Reminders", value="8h, 4h, 2h, 1h", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-
-# ============================================================
 # CWL Commands
-# ============================================================
 
 @bot.tree.command(name="cwl", description="Show CWL status and standings")
 @app_commands.describe(show="Show message publicly in channel")
@@ -1482,7 +2261,6 @@ async def cwl_command(interaction: discord.Interaction, show: bool = False):
     
     await interaction.followup.send(embed=embed)
 
-
 @bot.tree.command(name="cwlstats", description="[Admin] Show CWL individual performance")
 @app_commands.describe(show="Show message publicly in channel")
 @is_admin_or_coleader()
@@ -1629,13 +2407,9 @@ async def cwlstats_command(interaction: discord.Interaction, show: bool = False)
             inline=False
         )
     
-    embed.set_footer(text="Live data from API • Bonus recommendations on Day 4 and Day 7")
     await interaction.followup.send(embed=embed)
 
-
-# ============================================================
 # Main
-# ============================================================
 
 if __name__ == "__main__":
     if not config.BOT_TOKEN:

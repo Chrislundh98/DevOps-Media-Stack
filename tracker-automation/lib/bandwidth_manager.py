@@ -19,13 +19,11 @@ QBIT_PASS = os.getenv("QBIT_PASS")
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))
 
-# LAN subnet and your username
 LAN_SUBNET = os.getenv("LAN_SUBNET", "192.168.0.0/24")
-LOCAL_USER = os.getenv("LOCAL_USER", "your-username")
+LOCAL_USER = os.getenv("LOCAL_USER", "")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 class BandwidthManager:
     def __init__(self):
@@ -48,7 +46,7 @@ class BandwidthManager:
             data={'username': QBIT_USER, 'password': QBIT_PASS},
             timeout=5
         )
-        if resp.text != "Ok.":
+        if resp.status_code not in (200, 204) or resp.text not in ("Ok.", ""):
             raise Exception("qBittorrent auth failed")
         logger.info("Authenticated with qBittorrent")
 
@@ -151,7 +149,6 @@ class BandwidthManager:
             except Exception as e:
                 logger.error(f"Error: {e}")
                 time.sleep(CHECK_INTERVAL)
-
 
 if __name__ == "__main__":
     BandwidthManager().run()

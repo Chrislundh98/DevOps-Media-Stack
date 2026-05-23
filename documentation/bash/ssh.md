@@ -18,7 +18,7 @@ ssh root@192.168.0.80                  # Connect as root
 
 **Step 1: Generate a key pair (on your local machine):**
 ```bash
-ssh-keygen -t ed25519 -C "christoffer@nas"
+ssh-keygen -t ed25519 -C "you@hostname"
 # Press Enter for default location (~/.ssh/id_ed25519)
 # Optionally set a passphrase
 ```
@@ -44,7 +44,7 @@ Save connection shortcuts in `~/.ssh/config`:
 ```
 Host nas
     HostName 192.168.0.80
-    User NemNemsson
+    User youruser
     Port 22
 
 Host vps
@@ -56,7 +56,7 @@ Host vps
 
 Now just type:
 ```bash
-ssh nas        # Instead of ssh NemNemsson@192.168.0.80
+ssh nas        # Instead of ssh youruser@192.168.0.80
 ssh vps        # Instead of ssh root@203.0.113.50 -p 2222
 ```
 

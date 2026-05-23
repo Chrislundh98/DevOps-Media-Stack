@@ -3,7 +3,6 @@ import logging
 import os
 from datetime import datetime
 
-
 class DiscordNotifier:
 
     def __init__(self, webhook_url=None, hook_type='torrent'):

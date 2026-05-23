@@ -1,74 +1,87 @@
 # Tracker Automation
 
-Automated management system for private BitTorrent trackers. Handles seeding health monitoring, stalled torrent cleanup, Hit-and-Run (HnR) resolution, and daily statistics reporting.
+Management system for two private BitTorrent trackers (TorrentLeech, DigitalCore). Handles seeding health, stalled-torrent cleanup, Hit-and-Run resolution, daily reporting, and a fuzzy/ML name matcher to bridge tracker listings and the local qBittorrent client.
 
-## Architecture
+## Layout
 
 ```
-core/                   # Tracker-specific monitors and reporters
-  torrentleech.py       # TorrentLeech monitor (Cloudflare-protected)
-  digitalcore.py        # DigitalCore monitor
-  tl_reporter.py        # TorrentLeech daily stats reporter
-  dc_reporter.py        # DigitalCore daily stats reporter
-  base_monitor.py       # Shared base class for monitors
-  achievements.py       # Achievement tracking (long-term seeding milestones)
+core/                   Tracker monitors and reporters
+  torrentleech.py       TL monitor (cookie + Cloudflare bypass)
+  digitalcore.py        DC monitor
+  tl_reporter.py        TL daily stats reporter
+  dc_reporter.py        DC daily stats reporter
+  tl_big_boys.py        Long-term seeding leaderboard scrape
+  base_monitor.py       Shared monitor base class
+  achievements.py       Achievement / milestone tracking
 
-lib/                    # Shared libraries
-  auth/                 # Authentication modules
-    cloudflare.py       # Cloudflare challenge bypass
-    cookies.py          # Cookie-based session management
-    tl_client.py        # TorrentLeech HTTP client
-  matching/             # Torrent name matching engine
-    matcher.py          # Fuzzy matching between tracker and qBittorrent names
-    normalizer.py       # Name normalization (strip tags, codecs, groups)
-    training.py         # Training data collection for ML pipeline
-  notifications/        # Discord notification formatting
-  qbit/                 # qBittorrent API client wrapper
-  bandwidth_manager.py  # Dynamic bandwidth throttling based on Jellyfin streams
-  tracker_utils.py      # Shared utility functions
+lib/
+  auth/                 Cookie + chromedriver session helpers, Cloudflare bypass
+  matching/             Name matching pipeline
+    normalizer.py       Token extraction, codec/group/tag stripping
+    matcher.py          Fuzzy matcher (lexical + size validation)
+    features.py         Feature extraction for the ML model
+    ml_model.py         Trained scikit-learn model wrapper
+    ml_matcher.py       Hybrid lexical/ML matcher
+    translation_matcher.py  Non-English title fallback
+    training.py         Collect labelled (tracker, qbit) pairs at runtime
+    feedback.py         Human-in-the-loop feedback storage
+    recovery_queue.py   Re-attempt queue for previously unmatched torrents
+    retry_queue.py      Backoff retry for transient failures
+  notifications/        Discord webhook formatter
+  qbit/                 qBittorrent API wrapper
+  bandwidth_manager.py  Dynamic upload limit based on active Jellyfin streams
+  torrent_lifecycle.py  HnR + lifecycle event tracking
+  tracker_utils.py      Shared utilities
 
-qbittorrent/            # qBittorrent management utilities
-  announcer.py          # Continuous tracker reannounce loop
-  seeder.py             # Force-start seeding for stalled uploads
-  queue.py              # Large torrent queue management (1 TiB+)
-  cleaner.py            # Orphaned torrent detection and cleanup
-  inspector.py          # Torrent state inspection and diagnostics
+qbittorrent/            Maintenance services (run as Docker containers)
+  seeder.py             Force-start stalled uploads
+  announcer.py          Continuous reannounce loop
+  cleaner.py            Orphan detection
+  inspector.py          State inspection + diagnostics
+  queue.py              Queue management for large (1 TiB+) torrents
 
-docker/                 # Container configuration (qBittorrent utilities only)
-scripts/                # Host-side cron runner scripts
+tools/
+  add_verified_matches.py   Manually label tricky pairs into the training set
+  train_model.py            Train and serialize the matching model
+
+tl-visitor/             Standalone container that keeps a TL session warm
+                        via a real Chromium profile + Xvfb. Avoids Selenium
+                        for the daily "logged-in" visit that maintains the
+                        consecutive-days counter.
+
+run/                    Cron-friendly host runner scripts
+docker/                 Containers for the qBittorrent maintenance services
 ```
 
-## How It Works
+## Operation
 
-### Monitor Cycle (runs every 2 hours)
+Each tracker has a 2-hour monitor and a daily reporter. The monitor:
 
-1. Authenticate via saved cookies (TL uses undetected-chromedriver for Cloudflare)
-2. Check and resolve any Hit-and-Run warnings by downloading affected torrents
-3. Scrape seeding page across all pages
-4. Track upload history per torrent with rolling snapshots
-5. Flag stalled torrents (low upload relative to time and size)
-6. Match flagged names to qBittorrent entries using fuzzy matching
-7. Remove confirmed stalled torrents and log training data
-8. Send Discord notification with results
+1. Logs in via stored cookies; on TL, undetected-chromedriver clears Cloudflare.
+2. Resolves any Hit-and-Run warnings by re-downloading the affected torrents into a watch folder.
+3. Scrapes every page of the seeding profile.
+4. Updates rolling per-torrent upload-rate snapshots.
+5. Flags torrents whose upload rate has fallen below the per-tracker threshold for too long.
+6. Resolves each flagged tracker name to a qBittorrent torrent using the matching pipeline.
+7. Removes confirmed stalls, records each match/miss as training data.
+8. Posts a Discord summary.
 
-### Name Matching
+## Name matching
 
-Tracker names and qBittorrent names often differ (dots vs spaces, missing tags, different formatting). The matching engine normalizes both names, compares them using multiple strategies (exact, fuzzy, containment), and validates matches by file size. Every match/miss is logged as training data for a planned ML upgrade.
+Tracker and client names usually drift apart (dots vs spaces, codec tags, scene group, release year, language tags). The pipeline normalizes both sides, scores them with a combination of token overlap, fuzz ratios, and size sanity checks, and falls back to a trained model when lexical scoring is ambiguous. Every decision is logged as `(tracker_name, qbit_name, label)` so the training set grows from real traffic.
 
-### Daily Reporter
-
-Scrapes profile statistics (ratio, upload, download, bonus points), calculates match accuracy trends over 7/30/all-time windows, tracks top seeders and storage savings, and sends a formatted Discord embed.
+`translation_matcher` handles non-Latin titles by matching against romanized variants and known foreign-language alternates.
 
 ## Configuration
 
-All sensitive values are loaded from environment variables via `.env`:
+All secrets and host-specific values come from a `.env` file at the repo root. See `.env.example` (not committed) for the full list:
 
-```env
-USERNAME=your_tracker_username
-PASSWORD=your_tracker_password
-QBIT_URL=http://192.168.x.x:8080
-QBIT_USER=admin
-QBIT_PASS=your_password
-DISCORD_TORRENT_HOOK=https://discord.com/api/webhooks/...
-DISCORD_STATS_HOOK=https://discord.com/api/webhooks/...
-```
+- TorrentLeech: `TL_USERNAME`, `TL_PASSWORD`
+- DigitalCore: `DC_USER_ID`, `DC_USER_HANDLE`, cookies in `storage/json/`
+- qBittorrent: `QBIT_URL`, `QBIT_USER`, `QBIT_PASS`
+- Discord: `DISCORD_TORRENT_HOOK`, `DISCORD_STATS_HOOK`
+- Bandwidth manager: `LAN_SUBNET`, `JELLYFIN_API`
+
+## Stack
+
+Python 3.11, Selenium + undetected-chromedriver, requests, BeautifulSoup, rapidfuzz, scikit-learn, qbittorrent-api, Docker.

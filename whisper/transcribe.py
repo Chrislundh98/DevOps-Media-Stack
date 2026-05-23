@@ -40,7 +40,6 @@ AUDIO_EXTENSIONS = {
     ".wma", ".aac", ".mp4", ".mkv", ".webm",
 }
 
-
 # ──────────────────────────────────────────────────────────────
 # Dependency Check
 # ──────────────────────────────────────────────────────────────
@@ -60,7 +59,6 @@ def check_dependencies():
         print(f"Missing: {', '.join(missing)}")
         print(f"Install: pip install {' '.join(missing)}")
         sys.exit(1)
-
 
 # ──────────────────────────────────────────────────────────────
 # Device Detection
@@ -108,7 +106,6 @@ def detect_device(requested: str = "auto") -> tuple[str, str]:
 
     return "cpu", "int8"
 
-
 # ──────────────────────────────────────────────────────────────
 # Data Structures
 # ──────────────────────────────────────────────────────────────
@@ -135,14 +132,12 @@ class Config:
     guide_path: Optional[str] = None
     output_format: str = "docx"
 
-
 @dataclass
 class Segment:
     start: float
     end: float
     text: str
     speaker: str = ""
-
 
 # ──────────────────────────────────────────────────────────────
 # Interview Guide Parser
@@ -233,7 +228,6 @@ def parse_interview_guide(path: str) -> list[dict]:
             print(f"    ... and {len(questions) - 3} more")
 
     return questions
-
 
 # ──────────────────────────────────────────────────────────────
 # Transcription Engine
@@ -900,7 +894,6 @@ class Transcriber:
 
         return blocks
 
-
 # ──────────────────────────────────────────────────────────────
 # Output Formatters
 # ──────────────────────────────────────────────────────────────
@@ -909,7 +902,6 @@ def fmt_ts(seconds: float) -> str:
     h, remainder = divmod(int(seconds), 3600)
     m, s = divmod(remainder, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
 
 def save_docx(blocks: list[dict], path: str, source: str, guide: list[dict] = None):
     from docx import Document
@@ -958,7 +950,6 @@ def save_docx(blocks: list[dict], path: str, source: str, guide: list[dict] = No
 
     doc.save(path)
 
-
 def save_txt(blocks: list[dict], path: str, source: str):
     lines = [f"INTERVIEW TRANSCRIPT — {source}", "=" * 60, ""]
     for block in blocks:
@@ -974,11 +965,9 @@ def save_txt(blocks: list[dict], path: str, source: str):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-
 def save_json(blocks: list[dict], path: str, source: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"source": source, "blocks": blocks}, f, ensure_ascii=False, indent=2)
-
 
 # ──────────────────────────────────────────────────────────────
 # CLI
@@ -1083,7 +1072,6 @@ examples:
             console.print(f"  [{style}]{label}[/{style}] [{fmt_ts(block['start'])}]: {text}")
 
     console.print(f"\n[bold green]Done.[/bold green] Processed {len(audio_files)} file(s).")
-
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     chromium \
     chromium-driver \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

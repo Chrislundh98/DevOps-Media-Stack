@@ -96,7 +96,7 @@ rsync -avz -e "ssh -p 2222" /local/ user@server:/remote/
 
 ---
 
-## 📦 Sending Zip Files for Dev Projects
+## Sending Zip Files for Dev Projects
 
 This is the command for packaging a project folder into a zip and sending it to Claude or any dev workflow. Uses rsync to quickly get the zip to the right place.
 
@@ -124,7 +124,7 @@ rsync -avP /tmp/project.zip /volume2/dev-transfer/
 cd /volume1 && zip -r /tmp/automation.zip automation/ \
   -x "*.log" -x "__pycache__/*" -x "venv/*" -x ".env" -x "*.pyc" \
   -x "*/storage/training/*" -x "*/chrome_profile_*" -x "*.db" \
-  && echo "✅ Ready: /tmp/automation.zip ($(du -sh /tmp/automation.zip | cut -f1))"
+  && echo "Ready: /tmp/automation.zip ($(du -sh /tmp/automation.zip | cut -f1))"
 ```
 
 ---
@@ -170,7 +170,7 @@ rsync -av \
   --exclude 'config.json' \
   /volume1/automation/ /volume1/portfolio/
 
-echo "✅ Synced. Now cd /volume1/portfolio && git status"
+echo "Synced. Now cd ~/portfolio && git status"
 ```
 
 ---

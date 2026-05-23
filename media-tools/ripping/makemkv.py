@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from trackers.lib import DiscordNotifier
 
-MOVIES_PATH = "/volume2/media/movies"
-OUTPUT_PATH = "/volume2/data/remuxed"
+MOVIES_PATH = os.getenv("MOVIES_PATH", "/mnt/storage/media/movies")
+OUTPUT_PATH = os.getenv("OUTPUT_PATH", "/mnt/storage/data/remuxed")
 CONTAINER_NAME = "makemkv"
 MIN_TITLE_LENGTH_SECONDS = 1200
 

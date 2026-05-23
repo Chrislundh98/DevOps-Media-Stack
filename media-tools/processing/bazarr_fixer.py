@@ -12,11 +12,11 @@ import requests
 from dotenv import load_dotenv
 
 # Paths
-ENV_PATH = "/volume1/automation/.env"
-MOVIE_SCAN_PATH = "/volume2/media/movies"
-CACHE_FILE = "/volume1/automation/storage/json/bazarr_extended_processed.json"
+_base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.getenv("ENV_PATH", os.path.join(_base, ".env"))
+MOVIE_SCAN_PATH = os.getenv("MOVIE_SCAN_PATH", "/mnt/storage/media/movies")
+CACHE_FILE = os.getenv("CACHE_FILE", os.path.join(_base, "storage", "bazarr_extended_processed.json"))
 
-# Load environment
 load_dotenv(ENV_PATH)
 BAZARR_URL = os.getenv("BAZARR_URL", "").rstrip('/')
 BAZARR_API = os.getenv("BAZARR_API")
@@ -24,7 +24,6 @@ BAZARR_API = os.getenv("BAZARR_API")
 # Settings
 LANGUAGE = "en"
 MIN_SCORE = 70
-
 
 def load_cache():
     if os.path.exists(CACHE_FILE):
@@ -35,12 +34,10 @@ def load_cache():
             return {"processed": []}
     return {"processed": []}
 
-
 def save_cache(cache):
     os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
     with open(CACHE_FILE, 'w') as f:
         json.dump(cache, f, indent=2)
-
 
 def api_get(endpoint, params=None, timeout=180):
     """GET request to Bazarr API"""
@@ -61,7 +58,6 @@ def api_get(endpoint, params=None, timeout=180):
         print(f"    API Error: {e}")
     return None
 
-
 def api_delete(endpoint, params):
     """DELETE request to Bazarr API"""
     try:
@@ -74,7 +70,6 @@ def api_delete(endpoint, params):
         return r.status_code in [200, 204]
     except:
         return False
-
 
 def api_patch(endpoint, params, json_data):
     """PATCH request to Bazarr API"""
@@ -99,7 +94,6 @@ def api_patch(endpoint, params, json_data):
         print(f"    Error: {e}")
         return False
 
-
 def scan_for_extended_movies():
     """Scan movie library for Extended editions"""
     print(f"Scanning {MOVIE_SCAN_PATH} for Extended editions...")
@@ -121,7 +115,6 @@ def scan_for_extended_movies():
     
     print(f"Found {len(extended_files)} Extended edition(s)")
     return extended_files
-
 
 def get_bazarr_movies():
     """Fetch all movies from Bazarr"""
@@ -146,7 +139,6 @@ def get_bazarr_movies():
     print(f"Fetched {len(all_movies)} movies from Bazarr")
     return all_movies
 
-
 def find_movie_in_bazarr(filename, bazarr_movies):
     """Match local file to Bazarr movie"""
     for movie in bazarr_movies:
@@ -154,7 +146,6 @@ def find_movie_in_bazarr(filename, bazarr_movies):
         if bazarr_filename == filename:
             return movie
     return None
-
 
 def delete_existing_subtitles(movie):
     """Delete all existing subtitles for a movie"""
@@ -176,7 +167,6 @@ def delete_existing_subtitles(movie):
                 "language": sub_lang
             })
     time.sleep(1)
-
 
 def search_and_download_extended_subtitle(movie):
     """Search for Extended subtitles and download the best one"""
@@ -254,7 +244,6 @@ def search_and_download_extended_subtitle(movie):
         print("    ✗ Download failed")
         return False
 
-
 def main():
     if not BAZARR_URL or not BAZARR_API:
         print("ERROR: BAZARR_URL or BAZARR_API not set in .env")
@@ -325,7 +314,6 @@ def main():
     print("DONE")
     print(f"Success: {success}")
     print(f"Failed: {failed}")
-
 
 if __name__ == "__main__":
     main()

@@ -8,16 +8,14 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-from selenium.webdriver.chrome.options import Options
 from qbittorrentapi import Client, APIConnectionError
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from lib import CookieManager, CloudflareBypass
+from lib import CookieManager, CloudflareBypass, create_chrome_driver
 
 # --- Selectors ---
 LOGGED_IN_PROOF_SELECTOR = (By.CSS_SELECTOR, "a[href*='/user/profile']")
@@ -30,7 +28,6 @@ NEXT_BUTTON_SELECTOR = (By.CSS_SELECTOR, "li#profile-seedingTable_next a")
 NEXT_BUTTON_LI_SELECTOR = (By.ID, "profile-seedingTable_next")
 NOTIFICATIONS_TABLE_SELECTOR = (By.ID, "notificationsTable")
 NOTIFICATIONS_INFO_SELECTOR = (By.ID, "notificationsTable_info")
-
 
 class StatsReporter:
 
@@ -55,6 +52,7 @@ class StatsReporter:
         self.notification_cache_path = self.storage_dir / 'notification_cache.json'
         self.accuracy_log_file = self.storage_dir / 'accuracy_log.json'
         self.daily_saved_cache = self.storage_dir / 'daily_saved_storage.json'
+        self.streak_cache_path = self.storage_dir / 'streak_history.json'
 
         self.base_url = "https://www.torrentleech.org/"
         self.browse_url = "https://www.torrentleech.org/torrents/browse"
@@ -77,33 +75,8 @@ class StatsReporter:
         if not cookies:
             logging.error("No cookies found. Exiting.")
             return False
-        if user_agent:
-            logging.info("Using custom User-Agent from cookie file")
 
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument("--disable-background-networking")
-        chrome_options.add_argument("--disable-default-apps")
-        chrome_options.add_argument("--disable-sync")
-        chrome_options.add_argument("--disable-translate")
-        chrome_options.add_argument("--metrics-recording-only")
-        chrome_options.add_argument("--mute-audio")
-        chrome_options.add_argument("--no-first-run")
-        chrome_options.add_argument("--safebrowsing-disable-auto-update")
-        chrome_options.add_argument("--force-device-scale-factor=1")
-        if user_agent:
-            chrome_options.add_argument(f"--user-agent={user_agent}")
-        chrome_options.page_load_strategy = 'normal'
-
-        self.driver = uc.Chrome(options=chrome_options, version_main=141)
-        self.driver.set_page_load_timeout(90)
-        self.driver.set_script_timeout(60)
+        self.driver = create_chrome_driver(user_agent=user_agent)
         self._cookies = cookies
         return True
 
@@ -149,9 +122,7 @@ class StatsReporter:
         except:
             return "N/A"
 
-    # ======================================================================
     # MATCH ACCURACY
-    # ======================================================================
 
     def _get_match_accuracy(self):
         if not self.accuracy_log_file.exists():
@@ -203,9 +174,7 @@ class StatsReporter:
             logging.error(f"Failed to calculate match accuracy: {e}", exc_info=True)
             return {'all_time': 'Error', 'last_30_days': 'Error', 'last_7_days': 'Error', 'trend': '❌', 'trend_text': 'Error'}
 
-    # ======================================================================
     # SAVED STORAGE
-    # ======================================================================
 
     def _get_and_clear_saved_storage(self):
         if not self.daily_saved_cache.exists():
@@ -225,9 +194,7 @@ class StatsReporter:
             logging.error(f"Failed to clear cache: {e}")
         return self._format_megabytes(total)
 
-    # ======================================================================
     # NOTIFICATIONS
-    # ======================================================================
 
     def _load_notification_cache(self):
         if not self.notification_cache_path.exists():
@@ -286,9 +253,7 @@ class StatsReporter:
             logging.error(f"Error checking notifications: {e}")
             return None
 
-    # ======================================================================
     # HISTORY & SEEDING
-    # ======================================================================
 
     def _load_history(self):
         if not self.history_path.exists():
@@ -437,11 +402,27 @@ class StatsReporter:
         except:
             return 0.0
 
-    # ======================================================================
-    # DISCORD
-    # ======================================================================
+    # STREAK HISTORY
 
-    def _send_discord_notification(self, ratio, hnr_count, points, streak, top, hottest, champ, accuracy, saved, notif=None, achievement=False):
+    def _load_streak_history(self):
+        if not self.streak_cache_path.exists():
+            return None
+        try:
+            with open(self.streak_cache_path, 'r') as f:
+                return json.load(f)
+        except:
+            return None
+
+    def _save_streak_history(self, streak_int, date_str):
+        try:
+            with open(self.streak_cache_path, 'w') as f:
+                json.dump({'date': date_str, 'streak': streak_int}, f)
+        except IOError as e:
+            logging.error(f"Failed to save streak history: {e}")
+
+    # DISCORD
+
+    def _send_discord_notification(self, ratio, hnr_count, points, streak, top, hottest, champ, accuracy, saved, notif=None, achievement=False, streak_alert=False):
         if not self.webhook_url:
             logging.error("DISCORD_STATS_HOOK not set")
             return
@@ -457,8 +438,13 @@ class StatsReporter:
             f"**💾 Total Storage Saved (24h):** `{saved}`",
             "",
             f"**🗓️ Consecutive Day Streak:** `{streak}`",
-            f"**💰 TL Points:** `{points}`"
         ]
+
+        if streak_alert:
+            parts.append("🔴 **STREAK ALERT — Visit TorrentLeech manually today!**")
+            parts.append("Streak did not increment. Automated visits may not be counting.")
+
+        parts.append(f"**💰 TL Points:** `{points}`")
 
         if notif:
             notif_ts = notif.get('timestamp', '').strip()
@@ -507,13 +493,20 @@ class StatsReporter:
             parts.append("")
             parts.append(f"**🚨 Warning:** You have `{hnr_count}` Hit & Runs!")
 
+        if hnr_warn:
+            color = 15158332   # red
+        elif streak_alert:
+            color = 16744272   # orange
+        else:
+            color = 3066993    # green
+
         data = {
             "username": "TorrentLeech Stats",
             "avatar_url": "https://www.torrentleech.org/favicon.ico",
             "embeds": [{
                 "title": title,
                 "description": "\n".join(parts),
-                "color": 15158332 if hnr_warn else 3066993
+                "color": color
             }]
         }
 
@@ -525,9 +518,7 @@ class StatsReporter:
         except requests.exceptions.RequestException as e:
             logging.error(f"Failed to send Discord notification: {e}")
 
-    # ======================================================================
     # RUN
-    # ======================================================================
 
     def run(self):
         if not self._create_driver():
@@ -589,19 +580,34 @@ class StatsReporter:
             except Exception as e:
                 logging.error(f"Streak scrape failed: {e}")
 
+            streak_alert = False
+            try:
+                streak_int = int(streak)
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+                prev = self._load_streak_history()
+                if prev and prev.get('date') == yesterday_str:
+                    if streak_int <= prev.get('streak', 0):
+                        streak_alert = True
+                        logging.warning(f"Streak did not increment! Yesterday: {prev['streak']}, Today: {streak_int}")
+                    else:
+                        logging.info(f"Streak incremented: {prev['streak']} -> {streak_int}")
+                self._save_streak_history(streak_int, today_str)
+            except (ValueError, TypeError):
+                logging.warning(f"Could not parse streak value '{streak}' for history comparison — skipping")
+
             accuracy = self._get_match_accuracy()
             saved = self._get_and_clear_saved_storage()
 
             self._send_discord_notification(ratio, hnr_count, points, streak,
                                             top_info, hottest, champ_info,
-                                            accuracy, saved, notif, achievement)
+                                            accuracy, saved, notif, achievement, streak_alert)
         except Exception as e:
             logging.error(f"Unhandled error: {e}", exc_info=True)
         finally:
             if self.driver:
                 self.driver.quit()
             logging.info("Driver quit.")
-
 
 if __name__ == "__main__":
     tracker = sys.argv[1] if len(sys.argv) > 1 else 'torrentleech'

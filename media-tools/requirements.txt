@@ -1,1 +1,2 @@
-# Media automation scripts
+python-dotenv
+requests

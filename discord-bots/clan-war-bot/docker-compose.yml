@@ -1,13 +1,43 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: coc-war-ollama
+    restart: unless-stopped
+    volumes:
+      - ./ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      # Match thread count to P-core logical CPU count (12) — inference is
+      # bandwidth/cache-bound and gets no benefit from running on the slower
+      # E-cores under contention.
+      - OLLAMA_NUM_THREADS=12
+      - OMP_NUM_THREADS=12
+    # Pin to P-cores only (4.8 GHz) for max single-stream inference speed.
+    # cpu_shares 4096 (4× default 1024) gives Ollama scheduler priority when
+    # any other process tries to share these cores.
+    cpuset: "0-11"
+    cpu_shares: 4096
+    mem_limit: "8g"
+    mem_reservation: "3g"
+
   coc-war-bot:
     build: .
     container_name: coc-war-bot
-    restart: unless-stopped
+    # on-failure:5 stops auto-restart after 5 consecutive failures so a
+    # Discord rate-limit / token issue can't snowball into a loop that
+    # extends the cooldown indefinitely. Without this, `unless-stopped`
+    # treated each 429 crash as a reason to immediately retry, hammering
+    # /users/@me until Discord locked the bot identity (error 40062).
+    restart: on-failure:5
     env_file:
       - .env
     volumes:
       - ./data:/app/data
-      - /volume1/automation/bots/coc-war/logs:/app/logs
+      - ./logs:/app/logs
     environment:
       - TZ=Europe/Stockholm
       - LOG_DIR=/app/logs
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:3b
+    depends_on:
+      - ollama

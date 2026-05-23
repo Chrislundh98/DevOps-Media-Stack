@@ -1,38 +1,54 @@
-# Environment and secrets
+# Secrets
 .env
-*.env
+.env.*
+!.env.example
+*.cookie
+*cookie*.json
+*token*.json
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-dist/
-build/
-venv/
+*.pyc
+*.pyo
+*.pyd
 .venv/
+venv/
+*.egg-info/
 
-# Logs
-*.log
+# Local state / data / logs
 logs/
-
-# Data and state
+log/
+data/
+state/
+storage/
+appdata/
+ollama_data/
+redroid-data/
+profile/
+chrome_profile_*/
+backups/
 *.db
+*.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
-*.json
-!requirements.txt
-!package.json
+*.sqlite3
 
-# Chrome profiles
-chrome_profile*/
+# OS
+.DS_Store
+Thumbs.db
 
-# IDE
+# Editor
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# Build artifacts
+dist/
+build/
+*.tar.gz
+
+# Local
+.env.local
+*.local

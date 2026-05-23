@@ -1,9 +1,17 @@
+# Media stack — the *arr suite routed through gluetun's VPN, plus
+# Jellyfin/Jellyseerr for playback and Tdarr/MakeMKV/mkvtoolnix for
+# transcoding and remuxing. Resource limits prevent any one container
+# from monopolising CPU or memory.
+
 networks:
   shared_network:
     name: shared_network
     external: true
 
 services:
+  # Single VPN tunnel that *arr + qbittorrent share via network_mode.
+  # Everything downloads through this container's interface; if gluetun
+  # dies, the rest can't reach the internet (kill-switch by design).
   gluetun:
     image: qmcgaw/gluetun:latest
     container_name: gluetun
@@ -14,31 +22,34 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "8080:8080"
-      - "7878:7878"
-      - "8989:8989"
-      - "9696:9696"
-      - "6767:6767"
-      - "7474:7474"
-      - "8191:8191"
-      - "2468:2468"
+      # Ports for containers that share gluetun's network namespace.
+      - "8080:8080"   # qBittorrent
+      - "7878:7878"   # Radarr
+      - "8989:8989"   # Sonarr
+      - "9696:9696"   # Prowlarr
+      - "6767:6767"   # Bazarr
+      - "7474:7474"   # autobrr
+      - "8191:8191"   # flaresolverr
+      - "2468:2468"   # unpackerr
       - "41487:41487/tcp"
       - "41487:41487/udp"
     volumes:
-      - /volume1/docker/appdata/gluetun:/gluetun
-      - /volume1/docker/appdata/gluetun/wg0.conf:/gluetun/wireguard/wg0.conf
+      - ${APPDATA}/gluetun:/gluetun
+      - ${APPDATA}/gluetun/wg0.conf:/gluetun/wireguard/wg0.conf
     environment:
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - PUID=1000
       - PGID=1000
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=wireguard
-      
       - DNS_ADDRESS=1.1.1.1
       - FIREWALL_VPN_INPUT_PORTS=41487
-      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/24,10.13.13.0/24,185.248.102.72/32
+      # Allow LAN + WireGuard subnet + provider endpoint outside the tunnel.
+      - FIREWALL_OUTBOUND_SUBNETS=${LAN_SUBNET},10.13.13.0/24,${VPN_ENDPOINT_CIDR}
       - UPDATER_PERIOD=24h
       - LOG_LEVEL=info
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
 
@@ -49,23 +60,23 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     volumes:
-      - /volume1/docker/appdata/radarr:/config
-      - /volume2/media/movies:/media/movies
-      - /volume2/media/concerts:/media/concerts
-      - /volume2/data/downloads:/downloads
+      - ${APPDATA}/radarr:/config
+      - ${MEDIA_ROOT}:/storage
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: service:gluetun
     depends_on:
       - gluetun
     deploy:
       resources:
         limits:
-          memory: '2G'
+          memory: '4G'
         reservations:
           memory: '256M'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7878/api/v3/system/status"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7878/ping"]
       interval: 2m
       timeout: 10s
       retries: 3
@@ -78,11 +89,12 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     volumes:
-      - /volume1/docker/appdata/sonarr:/config
-      - /volume2/media/series:/media/series
-      - /volume2/data/downloads:/downloads
+      - ${APPDATA}/sonarr:/config
+      - ${MEDIA_ROOT}:/storage
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: service:gluetun
     depends_on:
       - gluetun
@@ -93,7 +105,7 @@ services:
         reservations:
           memory: '256M'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8989/api/v3/system/status"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8989/ping"]
       interval: 2m
       timeout: 10s
       retries: 3
@@ -106,9 +118,11 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     volumes:
-      - /volume1/docker/appdata/prowlarr:/config
+      - ${APPDATA}/prowlarr:/config
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: service:gluetun
     depends_on:
       - gluetun
@@ -120,7 +134,7 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - LOG_LEVEL=info
       - CAPTCHA_SOLVER=none
       - NO_SANDBOX=true
@@ -128,6 +142,8 @@ services:
       - /dev/shm:/dev/shm
     cap_add:
       - SYS_ADMIN
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: service:gluetun
     depends_on:
       - gluetun
@@ -139,20 +155,28 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - WEBUI_PORT=8080
       - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:qbittorrent
       - TP_THEME=dark
     volumes:
-      - /volume1/docker/appdata/qbittorrent:/config
-      - /volume2/data/downloads:/downloads
-      - /volume2/data/cross-seed-links:/cross-seed-links
-      - /volume2/media/movies:/media/movies
-      - /volume2/media/series:/media/series
-      - /volume2/media/concerts:/media/concerts
+      - ${APPDATA}/qbittorrent:/config
+      # NVMe scratch space for in-progress torrents — moved to spinning
+      # disk by *arr post-import.
+      - ${SCRATCH_NVME}:/nvme_ssd
+      - ${MEDIA_ROOT}:/storage
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    # Slightly bias OOM killer toward qbit if memory gets tight.
+    oom_score_adj: 500
     network_mode: service:gluetun
     depends_on:
       - gluetun
+    # qBittorrent was running unconstrained and using >17 GiB. Cap it,
+    # lower cpu_shares so it yields to Jellyfin / Ollama under contention.
+    cpu_shares: 256
+    mem_limit: "6g"
+    mem_reservation: "1g"
 
   autobrr:
     image: ghcr.io/autobrr/autobrr:latest
@@ -161,9 +185,11 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     volumes:
-      - /volume1/docker/appdata/autobrr:/config
+      - ${APPDATA}/autobrr:/config
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: service:gluetun
     depends_on:
       - gluetun
@@ -178,18 +204,27 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - serverIP=0.0.0.0
     volumes:
-      - /volume1/docker/appdata/tdarr:/app/server
-      - /volume1/docker/appdata/tdarr/configs:/app/configs
-      - /volume1/docker/appdata/tdarr/logs:/app/logs
-      - /volume2/media/movies:/media/movies
-      - /volume2/media/series:/media/series
-      - /volume2/media/concerts:/media/concerts
-      - /volume1/tdarr_cache:/temp
+      - ${APPDATA}/tdarr:/app/server
+      - ${APPDATA}/tdarr/configs:/app/configs
+      - ${APPDATA}/tdarr/logs:/app/logs
+      - ${MEDIA_ROOT}/movies:/media/movies
+      - ${MEDIA_ROOT}/series:/media/series
+      - ${MEDIA_ROOT}/concerts:/media/concerts
+      - ${MEDIA_ROOT}/yoga:/media/yoga
+      - ${TDARR_CACHE}:/temp
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
+    # Transcoding is heavy but background — pin to E-cores so it doesn't
+    # fight Jellyfin or Ollama for P-core time. Mem cap because ffmpeg
+    # transient buffers can balloon.
+    cpuset: "12-19"
+    cpu_shares: 256
+    mem_limit: "4g"
 
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
@@ -198,15 +233,19 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     volumes:
-      - /volume1/docker/appdata/bazarr:/config
-      - /volume2/media/movies:/media/movies
-      - /volume2/media/series:/media/series
-      - /volume2/data/downloads:/downloads
+      - ${APPDATA}/bazarr:/config
+      - ${MEDIA_ROOT}:/storage
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: service:gluetun
     depends_on:
       - gluetun
+    deploy:
+      resources:
+        limits:
+          memory: '2G'
 
   makemkv:
     image: ghcr.io/jlesage/makemkv:latest
@@ -215,15 +254,20 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     ports:
       - '5800:5800'
     volumes:
-      - /volume1/docker/appdata/makemkv:/config
-      - /volume2/media/movies:/storage:ro
-      - /volume2/data/remuxed:/output
+      - ${APPDATA}/makemkv:/config
+      - ${MEDIA_ROOT}/movies:/storage:ro
+      - ${MEDIA_ROOT}/../data/remuxed:/output
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
+    cpuset: "12-19"
+    cpu_shares: 256
+    mem_limit: "2g"
 
   mkvtoolnix:
     image: ghcr.io/jlesage/mkvtoolnix:latest
@@ -232,15 +276,20 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
     ports:
       - '5801:5800'
     volumes:
-      - /volume1/docker/appdata/mkvtoolnix:/config
-      - /volume2/data:/data
-      - /volume2/media:/media
+      - ${APPDATA}/mkvtoolnix:/config
+      - ${DATA_ROOT}:/data
+      - ${MEDIA_ROOT}:/media
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
+    cpuset: "12-19"
+    cpu_shares: 256
+    mem_limit: "2g"
 
   unpackerr:
     image: ghcr.io/unpackerr/unpackerr:latest
@@ -250,14 +299,16 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - UN_MASK=002
       - UN_SONARR_0_URL=http://gluetun:8989
       - UN_RADARR_0_URL=http://gluetun:7878
       - UN_SONARR_0_API_KEY=${UN_SONARR_0_API_KEY}
       - UN_RADARR_0_API_KEY=${UN_RADARR_0_API_KEY}
     volumes:
-      - /volume2/data/downloads:/downloads
+      - ${DATA_ROOT}/downloads:/downloads
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
     depends_on:
@@ -274,39 +325,53 @@ services:
     container_name: jellyfin
     user: "1000:1000"
     group_add:
-      - "105"
+      - "992"   # render (for VAAPI)
+      - "44"    # video
     restart: unless-stopped
     ports:
       - 8096:8096/tcp
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
+      - LC_ALL=en_US.UTF-8
+      - LANG=en_US.UTF-8
     volumes:
-      - /volume1/docker/appdata/jellyfin:/config
-      - /volume1/docker/appdata/jellyfin/cache:/cache
-      - /volume2/media/series:/media/series
-      - /volume2/media/movies:/media/movies
-      - /volume2/media/concerts:/media/concerts
+      - ${APPDATA}/jellyfin:/config
+      - ${APPDATA}/jellyfin/cache:/cache
+      - ${MEDIA_ROOT}/series:/media/series
+      - ${MEDIA_ROOT}/movies:/media/movies
+      - ${MEDIA_ROOT}/concerts:/media/concerts
+      - ${MEDIA_ROOT}/yoga:/media/yoga
     devices:
       - /dev/dri:/dev/dri
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       shared_network:
+        # Pinned IP so NPM can reverse-proxy by address.
         ipv4_address: 172.18.0.15
-    
+    # User-facing: gets scheduler priority over background jobs. Allowed
+    # on all CPUs because hardware transcoding still benefits from spare
+    # P-core cycles. Mem cap so transcoding spikes can't OOM the host.
+    cpu_shares: 2048
+    mem_limit: "8g"
+    mem_reservation: "1g"
+
   jellyseerr:
-    image: fallenbagel/jellyseerr:latest
+    image: ghcr.io/seerr-team/seerr:latest
     container_name: jellyseerr
     restart: unless-stopped
     ports:
       - 5056:5055
     environment:
       - LOG_LEVEL=debug
-      - TZ=Europe/Stockholm
+      - TZ=${TZ}
       - PUID=1000
       - PGID=1000
     volumes:
-      - /volume1/docker/appdata/jellyseerr:/app/config
+      - ${APPDATA}/jellyseerr:/app/config
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     networks:
       - shared_network
-    

@@ -1,60 +1,29 @@
 # Docker Stacks
 
-Production Docker Compose configurations running on a NAS. Two stacks with clear separation of concerns.
+Two compose stacks that share an external `shared_network` bridge so containers in either stack can resolve each other by name.
 
-## Core Services (`core-services.yml`)
+## core/
 
-Infrastructure and monitoring services that run on the host network or the shared Docker network.
+Reverse proxy, two WireGuard tunnels (general + admin, separate subnets/keypairs), Glances, Wizarr, Jellystat + Postgres, and Watchtower. Watchtower is label-gated, so only opted-in containers update automatically; database images and the two WireGuard containers are pinned.
 
-| Service | Purpose | Port |
-|---|---|---|
-| Nginx Proxy Manager | Reverse proxy with SSL termination | 81 (admin), 8081/8443 |
-| WireGuard | VPN server for remote access (8 peers) | 51820/udp |
-| WireGuard Admin | Separate VPN for administrative access (3 peers) | 51821/udp |
-| Glances | Real-time system monitoring | Host network |
-| Wizarr | Media server invitation management | 5690 |
-| Jellystat + PostgreSQL | Jellyfin analytics and statistics | 3000 |
+Pinned IPs (`172.18.0.12` for NPM, `172.18.0.15` for Jellyfin) let the reverse proxy address backends without depending on DNS resolution order during startup.
 
-## Media Stack (`media-stack.yml`)
+## media/
 
-All media acquisition and processing services. Download traffic is routed through Gluetun VPN.
+Gluetun is the VPN gateway. The full *arr suite (Radarr, Sonarr, Prowlarr, Bazarr, autobrr, flaresolverr) plus qBittorrent and unpackerr all run with `network_mode: service:gluetun`, so a tunnel failure becomes a complete network outage for downloaders — kill-switch by design.
 
-| Service | Purpose | Network |
-|---|---|---|
-| Gluetun | WireGuard VPN tunnel for all download traffic | Bridge (exposes ports) |
-| Radarr | Movie management and automation | VPN (via Gluetun) |
-| Sonarr | TV series management and automation | VPN (via Gluetun) |
-| Prowlarr | Indexer management | VPN (via Gluetun) |
-| FlareSolverr | Cloudflare challenge solver for indexers | VPN (via Gluetun) |
-| qBittorrent | BitTorrent client | VPN (via Gluetun) |
-| Autobrr | IRC-based torrent automation | VPN (via Gluetun) |
-| Bazarr | Subtitle management | VPN (via Gluetun) |
-| Tdarr | Media transcoding (GPU-accelerated) | Shared network |
-| MakeMKV | Disc ripping (web UI) | Shared network |
-| MKVToolNix | MKV editing (web UI) | Shared network |
-| Unpackerr | Automatic archive extraction | Shared network |
-| Jellyfin | Media server (Intel QuickSync HW transcoding) | Shared network |
-| Jellyseerr | Media request management | Shared network |
+Jellyfin, Jellyseerr, MakeMKV, Tdarr, and mkvtoolnix sit on the regular bridge, since they shouldn't egress through the VPN.
 
-## Architecture
-```
-Internet
-  |
-  +-- Nginx Proxy Manager (SSL termination)
-  |     |
-  |     +-- Jellyfin (streaming)
-  |     +-- Jellyseerr (requests)
-  |     +-- Wizarr (invitations)
-  |
-  +-- WireGuard VPN (remote access)
-  |
-  +-- Gluetun VPN Tunnel
-        |
-        +-- qBittorrent (torrents)
-        +-- Radarr / Sonarr (automation)
-        +-- Prowlarr + FlareSolverr (indexers)
-        +-- Bazarr (subtitles)
-        +-- Autobrr (IRC automation)
-```
+Per-container resource notes:
 
-All download-related services use `network_mode: service:gluetun` to ensure traffic is routed through the VPN. If the VPN drops, these services lose network access entirely (kill switch behavior).
+| Container | CPU | Memory | Why |
+| --- | --- | --- | --- |
+| Jellyfin | `cpu_shares: 2048` | 8G limit, 1G reservation | User-facing — wins scheduler contention against background jobs |
+| qBittorrent | `cpu_shares: 256` | 6G limit | Was using 17.6 GiB unconstrained; yields to Jellyfin |
+| Tdarr | `cpuset: 12-19`, `cpu_shares: 256` | 4G | Pinned to E-cores so transcoding doesn't fight Jellyfin |
+| MakeMKV / mkvtoolnix | `cpuset: 12-19` | 2G each | Same reasoning as Tdarr |
+| Radarr / Sonarr / Bazarr | default | 2–4G | Bursty subtitle search / metadata refresh |
+
+## .env
+
+Both stacks read from a sibling `.env`. See `.env.example` for the required variables. No secret is ever inlined in compose files.

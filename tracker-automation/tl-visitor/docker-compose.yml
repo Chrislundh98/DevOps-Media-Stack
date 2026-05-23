@@ -1,0 +1,12 @@
+services:
+  tl-visit:
+    build: .
+    container_name: tl-visit
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./profile:/profile
+      - ../storage/json/tl_cookie.json:/cookies/tl_cookie.json:ro
+    ports:
+      - "5900:5900"   # VNC — only needed for LOGIN_MODE, safe to remove after initial setup
+    shm_size: "256mb" # Chrome needs shared memory headroom

@@ -11,9 +11,13 @@ class NameNormalizer:
     }
     
     AUDIO_PATTERNS = [
-        r'\b(dd5\.?1|dd2\.?0|7\.1|5\.1|2\.0|stereo|mono)\b',
-        r'\b(dts-?hd-?ma|truehd|atmos|ddp|dd\+|ac-?3|eac3)\b',
-        r'\b(pcm|aac|opus)\b',
+        # Channel configs: 5.1, 7.1, 2.0 — dot or space separated
+        r'\b(dd5[\. ]?1|dd2[\. ]?0|7[\. ]1|5[\. ]1|2[\. ]0|stereo|mono)\b',
+        # Codec identifiers — DTS-HD MA appears with hyphens OR spaces
+        r'\b(dts[-. ]?hd[-. ]?ma|dts[-. ]?hd|dts[-. ]?x|truehd|atmos|ddp|dd\+|ac-?3|eac3|lpcm)\b',
+        r'\b(pcm|aac|opus|flac)\b',
+        # Bare "ma" after dts-hd is already stripped; also strip bare "dts" suffix
+        r'\b(dts)\b',
     ]
     
     QUALITY_PATTERNS = [
@@ -54,6 +58,8 @@ class NameNormalizer:
     NOISE_TOKENS = {
         'web', 'bluray', 'remux', 'ddp5', 'ddp7', 'ddp2', 'dd5', 'dd2',
         '264', '265', 'avc', 'complete', 'shorts', '2ch',
+        'dts', 'hdr', 'sdr', 'hlg', 'hdr10', 'uhd', 'flac', 'opus',
+        'aac', 'pcm', 'lpcm', 'mkv', 'mp4', 'avi',
     }
     
     @staticmethod
@@ -89,7 +95,9 @@ class NameNormalizer:
             'removed_elements': []
         }
         
-        normalized = NameNormalizer.remove_tracker_suffix(name, tracker_tag)
+        normalized = re.sub(r'\s*\(\s*\d+[\.,]?\d*\s*(?:gi?b|mi?b|ti?b|kb)\s*\)\s*$', '', name, flags=re.IGNORECASE)
+        
+        normalized = NameNormalizer.remove_tracker_suffix(normalized, tracker_tag)
         
         normalized = re.sub(r'^\s*\[[a-zA-Z0-9\.-]+\]\s*', '', normalized, flags=re.IGNORECASE)
         

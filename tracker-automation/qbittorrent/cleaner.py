@@ -1,85 +1,103 @@
+#!/usr/bin/env python3
+"""
+Orphaned download cleaner.
+Removes files/folders in the download directory that are no longer
+tracked by any torrent in qBittorrent. Sacred (1_year_torrents) items
+are protected unconditionally.
+"""
 import logging
-import os
-from pathlib import Path
-from dotenv import load_dotenv
+import shutil
 import sys
+from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib import QbitClient
 
-class OrphanedCleaner:
-    
-    def __init__(self, dry_run=True):
-        base_dir = Path(__file__).parent.parent
-        log_dir = base_dir / 'logs' / 'qbittorrent'
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_dir / 'orphaned_cleaner.log'),
-                logging.StreamHandler()
-            ]
-        )
-        
-        self.dry_run = dry_run
-        self.scan_dirs = ["/volume2/data/downloads"]
-        self.qbit = QbitClient()
-    
-    def run(self):
-        logging.info(f"{'DRY RUN - ' if self.dry_run else ''}Orphaned Files Cleanup")
-        
-        with self.qbit as qbt:
-            all_torrents = qbt.torrents_info()
-            active_names = {t.name for t in all_torrents}
-            sacred_names = {t.name for t in all_torrents if t.category == "1_year_torrents"}
-            
-            logging.info(f"Active torrents: {len(active_names)}, Sacred: {len(sacred_names)}")
-            
-            orphaned = []
-            total_size = 0
-            
-            for scan_dir in self.scan_dirs:
-                scan_path = Path(scan_dir)
-                if not scan_path.exists():
+# Updated paths for new server
+SCAN_DIRS = [Path("/mnt/storage/data/downloads")]
+SACRED_CATEGORY = "1_year_torrents"
+EXCLUDED_NAMES = {"watch", "extracted", "incomplete", ".DS_Store", "@eaDir"}
+
+base_dir = Path(__file__).resolve().parent.parent
+log_dir = base_dir / "logs" / "qbittorrent"
+log_dir.mkdir(parents=True, exist_ok=True)
+load_dotenv(base_dir.parent / ".env")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_dir / "orphaned_cleaner.log"),
+        logging.StreamHandler(),
+    ],
+)
+
+def get_item_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+def run(dry_run: bool = True):
+    prefix = "[DRY RUN] " if dry_run else ""
+    logging.info(f"{prefix}Orphaned Files Cleanup - Starting")
+
+    with QbitClient() as qbt:
+        all_torrents = qbt.torrents_info()
+        active_names = {t.name for t in all_torrents}
+        sacred_names = {t.name for t in all_torrents if t.category == SACRED_CATEGORY}
+
+        logging.info(f"Active torrents: {len(active_names)}, Sacred: {len(sacred_names)}")
+
+        orphaned: list[tuple[Path, int]] = []
+        total_size = 0
+
+        for scan_dir in SCAN_DIRS:
+            if not scan_dir.exists():
+                logging.warning(f"Scan directory does not exist: {scan_dir}")
+                continue
+
+            for item in scan_dir.iterdir():
+                if item.name in EXCLUDED_NAMES or item.name.startswith("."):
                     continue
-                
-                for item in scan_path.iterdir():
-                    if item.name in active_names:
-                        continue
-                    
-                    if item.name in sacred_names:
-                        logging.warning(f"PROTECTED: {item.name}")
-                        continue
-                    
-                    try:
-                        if item.is_file():
-                            size = item.stat().st_size
-                        else:
-                            size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
-                        
-                        orphaned.append((item, size))
-                        total_size += size
-                        
-                    except Exception as e:
-                        logging.error(f"Error processing {item}: {e}")
-            
-            logging.info(f"Found {len(orphaned)} orphaned items ({total_size / (1024**3):.2f} GB)")
-            
-            if not self.dry_run and orphaned:
-                for item, size in orphaned:
-                    try:
-                        if item.is_file():
-                            item.unlink()
-                        else:
-                            import shutil
-                            shutil.rmtree(item)
-                        logging.info(f"Deleted: {item.name} ({size / (1024**3):.2f} GB)")
-                    except Exception as e:
-                        logging.error(f"Failed to delete {item}: {e}")
+
+                if item.name in sacred_names:
+                    logging.info(f"SACRED (protected): {item.name}")
+                    continue
+
+                if item.name in active_names:
+                    continue
+
+                try:
+                    size = get_item_size(item)
+                    orphaned.append((item, size))
+                    total_size += size
+                except Exception as e:
+                    logging.error(f"Error sizing {item.name}: {e}")
+
+        logging.info(f"Found {len(orphaned)} orphaned items ({total_size / (1024**3):.2f} GB)")
+
+        if not orphaned:
+            logging.info("Nothing to clean up.")
+            return
+
+        for item, size in orphaned:
+            size_str = f"{size / (1024**3):.2f} GB" if size > 1024**3 else f"{size / (1024**2):.1f} MB"
+            if dry_run:
+                logging.info(f"Would delete: {item.name} ({size_str})")
+                continue
+
+            try:
+                if item.is_file():
+                    item.unlink()
+                else:
+                    shutil.rmtree(item)
+                logging.info(f"Deleted: {item.name} ({size_str})")
+            except Exception as e:
+                logging.error(f"Failed to delete {item.name}: {e}")
+
+    logging.info(f"{prefix}Cleanup complete.")
 
 if __name__ == "__main__":
-    dry_run = '--execute' not in sys.argv
-    cleaner = OrphanedCleaner(dry_run=dry_run)
-    cleaner.run()
+    run(dry_run="--execute" not in sys.argv)

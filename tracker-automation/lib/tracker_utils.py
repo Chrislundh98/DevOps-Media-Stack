@@ -7,7 +7,6 @@ Identifies which tracker/indexer a torrent belongs to by checking its tracker UR
 
 import logging
 
-
 class TrackerIdentifier:
     """Utility class for identifying torrent trackers"""
     

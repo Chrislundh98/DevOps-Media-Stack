@@ -5,14 +5,12 @@ from datetime import datetime
 
 DATABASE_PATH = Path(__file__).parent / "data" / "bot.db"
 
-
 def get_connection() -> sqlite3.Connection:
     """Get a database connection with row factory enabled"""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_database():
     """Initialize database tables"""
@@ -134,7 +132,47 @@ def init_database():
             PRIMARY KEY (season_id, day_number)
         )
     """)
+
+    # Chat history for AI conversational mode (rolling window per user)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chat_history_user_time
+        ON chat_history(user_id, created_at DESC)
+    """)
     
+    # Store community events tracking
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS store_seen_events (
+            event_key TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            progress_percent INTEGER DEFAULT 0,
+            claim_ends_at INTEGER,
+            announced_start INTEGER DEFAULT 0,
+            announced_complete INTEGER DEFAULT 0,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Store free offers tracking
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS store_seen_offers (
+            offer_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            announced INTEGER DEFAULT 0,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Config table for bot settings
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS config (
@@ -157,10 +195,7 @@ def init_database():
     conn.close()
     print("[DB] Database initialized")
 
-
-# ============================================================
 # Discord Users
-# ============================================================
 
 def upsert_discord_user(discord_id: str, discord_name: str):
     """Insert or update a Discord user"""
@@ -176,7 +211,6 @@ def upsert_discord_user(discord_id: str, discord_name: str):
     conn.commit()
     conn.close()
 
-
 def get_discord_user(discord_id: str) -> Optional[dict]:
     """Get a Discord user by ID"""
     conn = get_connection()
@@ -186,10 +220,7 @@ def get_discord_user(discord_id: str) -> Optional[dict]:
     conn.close()
     return dict(row) if row else None
 
-
-# ============================================================
 # CoC Accounts
-# ============================================================
 
 def upsert_coc_account(player_tag: str, player_name: str):
     """Insert or update a CoC account"""
@@ -210,7 +241,6 @@ def upsert_coc_account(player_tag: str, player_name: str):
     conn.commit()
     conn.close()
 
-
 def get_coc_account(player_tag: str) -> Optional[dict]:
     """Get a CoC account by tag"""
     if not player_tag.startswith("#"):
@@ -224,10 +254,7 @@ def get_coc_account(player_tag: str) -> Optional[dict]:
     conn.close()
     return dict(row) if row else None
 
-
-# ============================================================
 # Account Links (Many-to-Many)
-# ============================================================
 
 def link_account(player_tag: str, discord_id: str, linked_by: str = None) -> bool:
     """
@@ -253,7 +280,6 @@ def link_account(player_tag: str, discord_id: str, linked_by: str = None) -> boo
         conn.close()
         return False
 
-
 def unlink_account(player_tag: str, discord_id: str) -> bool:
     """
     Unlink a CoC account from a Discord user.
@@ -274,7 +300,6 @@ def unlink_account(player_tag: str, discord_id: str) -> bool:
     conn.close()
     return deleted
 
-
 def unlink_all_from_account(player_tag: str) -> int:
     """
     Remove all Discord links from a CoC account.
@@ -292,7 +317,6 @@ def unlink_all_from_account(player_tag: str) -> int:
     conn.close()
     return deleted
 
-
 def get_discord_ids_for_account(player_tag: str) -> list[str]:
     """Get all Discord user IDs linked to a CoC account"""
     if not player_tag.startswith("#"):
@@ -308,7 +332,6 @@ def get_discord_ids_for_account(player_tag: str) -> list[str]:
     conn.close()
     return [row["discord_id"] for row in rows]
 
-
 def get_accounts_for_discord_user(discord_id: str) -> list[dict]:
     """Get all CoC accounts linked to a Discord user"""
     conn = get_connection()
@@ -323,7 +346,6 @@ def get_accounts_for_discord_user(discord_id: str) -> list[dict]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
 
 def get_all_links() -> list[dict]:
     """Get all account links with full info"""
@@ -344,7 +366,6 @@ def get_all_links() -> list[dict]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
 
 def get_unlinked_players_in_war(war_member_tags: list[str]) -> list[dict]:
     """
@@ -378,10 +399,7 @@ def get_unlinked_players_in_war(war_member_tags: list[str]) -> list[dict]:
     conn.close()
     return [dict(row) for row in rows]
 
-
-# ============================================================
 # Sent Reminders
-# ============================================================
 
 def has_reminder_been_sent(war_id: str, player_tag: str, threshold_hours: int) -> bool:
     """Check if a reminder has already been sent for this war/player/threshold"""
@@ -399,7 +417,6 @@ def has_reminder_been_sent(war_id: str, player_tag: str, threshold_hours: int) -
     conn.close()
     return exists
 
-
 def record_reminder_sent(war_id: str, player_tag: str, threshold_hours: int):
     """Record that a reminder was sent"""
     if not player_tag.startswith("#"):
@@ -415,7 +432,6 @@ def record_reminder_sent(war_id: str, player_tag: str, threshold_hours: int):
     conn.commit()
     conn.close()
 
-
 def clear_reminders_for_war(war_id: str):
     """Clear all sent reminders for a specific war"""
     conn = get_connection()
@@ -424,10 +440,7 @@ def clear_reminders_for_war(war_id: str):
     conn.commit()
     conn.close()
 
-
-# ============================================================
 # Config
-# ============================================================
 
 def get_config(key: str) -> Optional[str]:
     """Get a config value"""
@@ -437,7 +450,6 @@ def get_config(key: str) -> Optional[str]:
     row = cursor.fetchone()
     conn.close()
     return row["value"] if row else None
-
 
 def set_config(key: str, value: str):
     """Set a config value"""
@@ -450,7 +462,6 @@ def set_config(key: str, value: str):
     conn.commit()
     conn.close()
 
-
 def get_reminder_thresholds() -> list[int]:
     """Get reminder thresholds as list of hours"""
     value = get_config("reminder_thresholds")
@@ -458,10 +469,7 @@ def get_reminder_thresholds() -> list[int]:
         return [6, 3, 1]
     return [int(x.strip()) for x in value.split(",")]
 
-
-# ============================================================
 # War State (persistent across restarts)
-# ============================================================
 
 def get_war_state(war_id: str) -> Optional[dict]:
     """Get war state by ID"""
@@ -471,7 +479,6 @@ def get_war_state(war_id: str) -> Optional[dict]:
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
-
 
 def upsert_war_state(war_id: str, last_state: str, is_cwl: bool = False):
     """Create or update war state"""
@@ -487,12 +494,10 @@ def upsert_war_state(war_id: str, last_state: str, is_cwl: bool = False):
     conn.commit()
     conn.close()
 
-
 def has_war_start_been_announced(war_id: str) -> bool:
     """Check if war start has been announced"""
     state = get_war_state(war_id)
     return state is not None and state.get("announced_start", 0) == 1
-
 
 def mark_war_start_announced(war_id: str):
     """Mark war start as announced"""
@@ -505,24 +510,24 @@ def mark_war_start_announced(war_id: str):
     conn.commit()
     conn.close()
 
-
 def has_war_end_been_announced(war_id: str) -> bool:
     """Check if war end has been announced"""
     state = get_war_state(war_id)
     return state is not None and state.get("announced_end", 0) == 1
 
-
 def mark_war_end_announced(war_id: str):
-    """Mark war end as announced"""
+    """Mark war end as announced (upserts so it works even if record was cleaned up)"""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        UPDATE war_state SET announced_end = 1, updated_at = CURRENT_TIMESTAMP
-        WHERE war_id = ?
+        INSERT INTO war_state (war_id, announced_end, last_state, updated_at)
+        VALUES (?, 1, 'warEnded', CURRENT_TIMESTAMP)
+        ON CONFLICT(war_id) DO UPDATE SET
+            announced_end = 1,
+            updated_at = CURRENT_TIMESTAMP
     """, (war_id,))
     conn.commit()
     conn.close()
-
 
 def cleanup_old_war_states(days: int = 7):
     """Remove war states older than specified days"""
@@ -537,10 +542,7 @@ def cleanup_old_war_states(days: int = 7):
     conn.close()
     return deleted
 
-
-# ============================================================
 # CWL Tracking
-# ============================================================
 
 def get_or_create_cwl_season(clan_tag: str, season_id: str) -> dict:
     """Get or create a CWL season"""
@@ -566,7 +568,6 @@ def get_or_create_cwl_season(clan_tag: str, season_id: str) -> dict:
     conn.close()
     return dict(row)
 
-
 def update_cwl_day(season_id: str, day_number: int):
     """Update current day for a CWL season"""
     conn = get_connection()
@@ -577,7 +578,6 @@ def update_cwl_day(season_id: str, day_number: int):
     """, (day_number, season_id))
     conn.commit()
     conn.close()
-
 
 def record_cwl_performance(season_id: str, day_number: int, player_tag: str, 
                            player_name: str, stars: int, destruction: float,
@@ -599,7 +599,6 @@ def record_cwl_performance(season_id: str, day_number: int, player_tag: str,
     """, (season_id, day_number, player_tag, player_name, stars, destruction, attack_used, in_roster, opponent_tag))
     conn.commit()
     conn.close()
-
 
 def get_cwl_season_performance(season_id: str) -> list[dict]:
     """Get all performance records for a CWL season, aggregated by player"""
@@ -624,7 +623,6 @@ def get_cwl_season_performance(season_id: str) -> list[dict]:
     conn.close()
     return [dict(row) for row in rows]
 
-
 def get_cwl_day_performance(season_id: str, day_number: int) -> list[dict]:
     """Get performance records for a specific CWL day"""
     conn = get_connection()
@@ -637,7 +635,6 @@ def get_cwl_day_performance(season_id: str, day_number: int) -> list[dict]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
 
 def update_cwl_standings(season_id: str, clan_tag: str, clan_name: str,
                          stars: int, destruction: float, 
@@ -661,7 +658,6 @@ def update_cwl_standings(season_id: str, clan_tag: str, clan_name: str,
     conn.commit()
     conn.close()
 
-
 def get_cwl_standings(season_id: str) -> list[dict]:
     """Get CWL standings for a season"""
     conn = get_connection()
@@ -675,7 +671,6 @@ def get_cwl_standings(season_id: str) -> list[dict]:
     conn.close()
     return [dict(row) for row in rows]
 
-
 def has_cwl_bonus_been_sent(season_id: str, day_number: int) -> bool:
     """Check if bonus recommendation has been sent for this day"""
     conn = get_connection()
@@ -687,7 +682,6 @@ def has_cwl_bonus_been_sent(season_id: str, day_number: int) -> bool:
     conn.close()
     return row is not None
 
-
 def mark_cwl_bonus_sent(season_id: str, day_number: int):
     """Mark bonus recommendation as sent"""
     conn = get_connection()
@@ -698,7 +692,6 @@ def mark_cwl_bonus_sent(season_id: str, day_number: int):
     """, (season_id, day_number))
     conn.commit()
     conn.close()
-
 
 def get_cwl_roster_changes(season_id: str) -> dict:
     """Get roster changes across CWL days"""
@@ -728,7 +721,6 @@ def get_cwl_roster_changes(season_id: str) -> dict:
     
     return roster_history
 
-
 def cleanup_old_cwl_data(days: int = 45):
     """Remove CWL data older than specified days"""
     conn = get_connection()
@@ -746,7 +738,111 @@ def cleanup_old_cwl_data(days: int = 45):
         cursor.execute("DELETE FROM cwl_standings WHERE season_id = ?", (season_id,))
         cursor.execute("DELETE FROM cwl_bonus_sent WHERE season_id = ?", (season_id,))
         cursor.execute("DELETE FROM cwl_seasons WHERE season_id = ?", (season_id,))
-    
+
     conn.commit()
     conn.close()
     return len(old_seasons)
+
+# Chat history (AI conversational mode)
+
+def record_chat_message(user_id: str, channel_id: str, role: str, content: str):
+    """Persist a chat turn for the AI conversational fallback."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO chat_history (user_id, channel_id, role, content)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, channel_id, role, content))
+    conn.commit()
+    conn.close()
+
+def get_chat_history(user_id: str, limit: int = 10) -> list[dict]:
+    """Return the most recent chat turns for a user, oldest-first."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT role, content, created_at
+        FROM chat_history
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    rows.reverse()
+    return rows
+
+def cleanup_old_chat_history(days: int = 14, max_per_user: int = 50):
+    """Trim chat history: drop rows older than N days, then cap per-user rows."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM chat_history
+        WHERE created_at < datetime('now', ?)
+    """, (f'-{days} days',))
+
+    cursor.execute("SELECT DISTINCT user_id FROM chat_history")
+    user_ids = [row['user_id'] for row in cursor.fetchall()]
+    for uid in user_ids:
+        cursor.execute("""
+            DELETE FROM chat_history
+            WHERE id IN (
+                SELECT id FROM chat_history
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT -1 OFFSET ?
+            )
+        """, (uid, max_per_user))
+
+    conn.commit()
+    conn.close()
+
+# Store Monitor
+
+def get_store_event(event_key: str) -> Optional[dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM store_seen_events WHERE event_key = ?", (event_key,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def upsert_store_event(event_key: str, title: str, progress_percent: int,
+                       claim_ends_at: Optional[int],
+                       announced_start: bool, announced_complete: bool):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO store_seen_events
+            (event_key, title, progress_percent, claim_ends_at, announced_start, announced_complete, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(event_key) DO UPDATE SET
+            title = excluded.title,
+            progress_percent = excluded.progress_percent,
+            claim_ends_at = excluded.claim_ends_at,
+            announced_start = excluded.announced_start,
+            announced_complete = excluded.announced_complete,
+            updated_at = CURRENT_TIMESTAMP
+    """, (event_key, title, progress_percent, claim_ends_at,
+          1 if announced_start else 0, 1 if announced_complete else 0))
+    conn.commit()
+    conn.close()
+
+def has_store_offer_been_announced(offer_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM store_seen_offers WHERE offer_id = ? AND announced = 1", (offer_id,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+def mark_store_offer_announced(offer_id: str, title: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO store_seen_offers (offer_id, title, announced)
+        VALUES (?, ?, 1)
+        ON CONFLICT(offer_id) DO UPDATE SET announced = 1
+    """, (offer_id, title))
+    conn.commit()
+    conn.close()

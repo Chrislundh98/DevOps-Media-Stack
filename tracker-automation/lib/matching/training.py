@@ -44,7 +44,6 @@ class FileRotationManager:
             logging.error(f"Failed to rotate file {file_path}: {e}")
             return False
 
-
 class TrainingDataManager:
     
     def __init__(self, training_file, accuracy_file, health_file=None):

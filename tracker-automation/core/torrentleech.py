@@ -10,19 +10,18 @@ import bencodepy
 from pathlib import Path
 from datetime import datetime, timedelta
 
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-from selenium.webdriver.chrome.options import Options
 from qbittorrentapi import Client, APIConnectionError
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.base_monitor import BaseMonitor
-from lib import CloudflareBypass, CookieManager, TorrentMatcher
+from lib import CloudflareBypass, CookieManager, TorrentMatcher, create_chrome_driver
+from lib.torrent_lifecycle import TorrentLifecycleTracker
 
 # Selectors
 LOGGED_IN_PROOF_SELECTOR = (By.CSS_SELECTOR, "a[href*='/user/profile']")
@@ -39,13 +38,12 @@ TORRENT_DOWNLOAD_LINK_SELECTOR = (By.ID, "detailsDownloadButton")
 HNR_NEXT_BUTTON_SELECTOR = (By.CSS_SELECTOR, "li.paginate_button.next:not(.disabled) a")
 HNR_NEXT_BUTTON_DISABLED_SELECTOR = (By.CSS_SELECTOR, "li.paginate_button.next.disabled")
 
-
 class TorrentLeechMonitor(BaseMonitor):
 
     TL_TRACKER_PATTERNS = ['tracker.tleechreload.org', 'tracker.torrentleech.org']
     DC_TRACKER_PATTERNS = ['trackerprxy.digitalcore.club', 'tracker.digitalcore.club']
 
-    HNR_DOWNLOAD_PATH = "/volume2/data/downloads/watch"
+    HNR_DOWNLOAD_PATH = "/mnt/storage/data/downloads/watch"
     HNR_CATEGORY = "manual"
     HNR_TAG = "TL"
     REMOVAL_CACHE_RETENTION_DAYS = 7
@@ -76,38 +74,10 @@ class TorrentLeechMonitor(BaseMonitor):
 
         self.session = requests.Session()
 
-    # ======================================================================
-    # CHROME DRIVER & AUTH (matches working old config exactly)
-    # ======================================================================
+    # CHROME DRIVER & AUTH
 
     def _init_driver(self, cookies, user_agent):
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument("--disable-background-networking")
-        chrome_options.add_argument("--disable-default-apps")
-        chrome_options.add_argument("--disable-sync")
-        chrome_options.add_argument("--disable-translate")
-        chrome_options.add_argument("--metrics-recording-only")
-        chrome_options.add_argument("--mute-audio")
-        chrome_options.add_argument("--no-first-run")
-        chrome_options.add_argument("--safebrowsing-disable-auto-update")
-        chrome_options.add_argument("--force-device-scale-factor=1")
-
-        if user_agent:
-            chrome_options.add_argument(f"--user-agent={user_agent}")
-            logging.info("Using custom User-Agent from cookie file")
-
-        chrome_options.page_load_strategy = 'normal'
-
-        self.driver = uc.Chrome(options=chrome_options, version_main=141)
-        self.driver.set_page_load_timeout(90)
-        self.driver.set_script_timeout(60)
+        self.driver = create_chrome_driver(user_agent=user_agent)
         logging.info("Chrome driver initialized (undetected_chromedriver).")
 
     def _login(self, cookies):
@@ -159,9 +129,7 @@ class TorrentLeechMonitor(BaseMonitor):
         for cookie in self.driver.get_cookies():
             self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', ''))
 
-    # ======================================================================
     # HNR FIXER
-    # ======================================================================
 
     def fix_hnr(self):
         logging.info("Checking for HnR warnings...")
@@ -354,9 +322,7 @@ class TorrentLeechMonitor(BaseMonitor):
 
         self._send_discord(embeds)
 
-    # ======================================================================
     # ADMIN DELETION NOTIFICATIONS
-    # ======================================================================
 
     def _get_notification_count(self):
         try:
@@ -563,9 +529,7 @@ class TorrentLeechMonitor(BaseMonitor):
         if embeds:
             self._send_discord(embeds, username="TorrentLeech Monitor")
 
-    # ======================================================================
     # LONGTERM CACHE & HISTORY
-    # ======================================================================
 
     def _load_longterm_ids(self):
         if not self.longterm_cache_file.exists():
@@ -634,9 +598,7 @@ class TorrentLeechMonitor(BaseMonitor):
 
         return history_data
 
-    # ======================================================================
     # REMOVAL CACHING
-    # ======================================================================
 
     def _log_removal_to_cache(self, tl_torrent, qbit_torrent, match_method, match_score):
         if self.removal_cache_file.exists():
@@ -709,9 +671,7 @@ class TorrentLeechMonitor(BaseMonitor):
             except IOError as e:
                 logging.error(f"Failed to write daily storage cache: {e}")
 
-    # ======================================================================
     # SCRAPING
-    # ======================================================================
 
     def scrape_seeding_torrents(self, longterm_ids=None):
         logging.info(f"Navigating to seeding page: {self.seeding_url}")
@@ -781,9 +741,7 @@ class TorrentLeechMonitor(BaseMonitor):
 
         return scraped
 
-    # ======================================================================
     # STALLED DETECTION & REMOVAL RULES
-    # ======================================================================
 
     def apply_removal_rules(self, scraped_torrents, history_data=None):
         if history_data is None:
@@ -800,15 +758,15 @@ class TorrentLeechMonitor(BaseMonitor):
             tid = t['id']
 
             if days >= 8 and uploaded <= 1024:
-                reason = "8+ days with ≤1GB uploaded"
-            elif days >= 10 and uploaded < 2560:
-                reason = "10+ days with <2.5GB uploaded"
-            elif days >= 12 and uploaded < 5120:
-                reason = "12+ days with <5GB uploaded"
-            elif days >= 14 and uploaded < 10240:
-                reason = "14+ days with <10GB uploaded"
-            elif days >= 18 and uploaded < 15360:
-                reason = "18+ days with <15GB uploaded"
+                reason = "7+ days with ≤1GB uploaded"
+            elif days >= 9 and uploaded < 2560:
+                reason = "9+ days with <2.5GB uploaded"
+            elif days >= 11 and uploaded < 5120:
+                reason = "11+ days with <5GB uploaded"
+            elif days >= 13 and uploaded < 10240:
+                reason = "13+ days with <10GB uploaded"
+            elif days >= 17 and uploaded < 15360:
+                reason = "17+ days with <15GB uploaded"
             elif days >= 20:
                 torrent_history = history_data.get(tid)
                 if torrent_history and 'snapshots' in torrent_history and len(torrent_history['snapshots']) > 1:
@@ -841,9 +799,7 @@ class TorrentLeechMonitor(BaseMonitor):
 
         return stalled
 
-    # ======================================================================
     # MATCHING & DELETION
-    # ======================================================================
 
     def _get_tl_torrents_from_qbit(self, all_torrents):
         tl_torrents = []
@@ -895,14 +851,18 @@ class TorrentLeechMonitor(BaseMonitor):
         return is_protected
 
     def _process_stalled_torrents(self, stalled_torrents):
-        if not stalled_torrents:
-            logging.info("No new stalled torrents found.")
-            return
+        # Run even when the new stalled list is empty — queues may have work.
+        logging.info(
+            f"Found {len(stalled_torrents)} stalled torrent(s). "
+            f"Retry queue: {self.retry_queue.stats()}, "
+            f"Recovery queue: {self.recovery_queue.stats()}"
+        )
 
-        logging.info(f"Found {len(stalled_torrents)} stalled torrents. Starting matching...")
         removed = []
         failed_matches = []
         hashes_to_delete = []
+        recovered_count = 0
+        retried_count = 0
 
         try:
             qbt_client = Client(host=self.qbit_url, username=self.qbit_user, password=self.qbit_pass)
@@ -912,45 +872,87 @@ class TorrentLeechMonitor(BaseMonitor):
             tl_qbit_torrents = self._get_tl_torrents_from_qbit(all_qbit_torrents)
             logging.info(f"Fetched {len(tl_qbit_torrents)} TL torrents for matching.")
 
+            # Sync lifecycle before matching so new arrivals are tracked
+            self.lifecycle.bulk_sync_from_qbit(all_qbit_torrents)
+
+            # ── Phase 0a: drain recovery queue (confirmed bad-match re-matches) ──
+            if stalled_torrents:
+                recovered_entries, recovery_failed = self._drain_recovery_queue(
+                    stalled_torrents, tl_qbit_torrents, tracker_tag="TL"
+                )
+                for entry in recovered_entries:
+                    qt = entry.pop('_qbit_torrent')
+                    if self._is_protected_torrent(qt):
+                        continue
+                    self._commit_tl_match(entry, qt, hashes_to_delete, removed)
+                    recovered_count += 1
+
+            # ── Phase 0b: drain retry queue (previously failed matches) ──
+            already_scheduled = set(hashes_to_delete)
+            retried_entries, _ = self._drain_retry_queue(
+                tl_qbit_torrents, tracker_tag="TL", exclude_hashes=already_scheduled
+            )
+            for entry in retried_entries:
+                qt = entry.pop('_qbit_torrent')
+                if self._is_protected_torrent(qt) or qt.hash in already_scheduled:
+                    continue
+                self._commit_tl_match(entry, qt, hashes_to_delete, removed)
+                already_scheduled.add(qt.hash)
+                retried_count += 1
+
+            # ── Phase 1: normal matching for this run's stalled torrents ──
             for tl_torrent in stalled_torrents:
                 matched = self._find_exact_qbit_match(tl_torrent['name'], tl_qbit_torrents)
                 match_method = "exact"
+                match_score = 1.0
 
                 if not matched:
-                    match_method = "fuzzy"
                     result = self.matcher.find_best_match(
                         tl_torrent['name'], tl_qbit_torrents,
                         tracker_tag="TL", tracker_size_mb=tl_torrent['size_mb']
                     )
-                    matched = result[0] if result[0] else None
+                    matched, match_score, match_method = result
+                    match_score = match_score or 0.0
 
                 if matched:
                     if self._is_protected_torrent(matched):
                         continue
+                    if matched.hash in already_scheduled:
+                        # Already being deleted by retry/recovery drain — skip
+                        continue
 
                     is_tl = False
                     for tracker in matched.trackers:
-                        if any(p in tracker.get('url', '').lower() for p in self.TL_TRACKER_PATTERNS):
+                        if any(p in tracker.get('url', '').lower()
+                               for p in self.TL_TRACKER_PATTERNS):
                             is_tl = True
                             break
 
                     if not is_tl:
-                        logging.critical(f"  CRITICAL: '{matched.name}' FAILED final tracker check.")
+                        logging.critical(
+                            f"  CRITICAL: '{matched.name}' FAILED final tracker check."
+                        )
                         failed_matches.append(tl_torrent)
                         continue
 
-                    hashes_to_delete.append(matched.hash)
                     tl_torrent['match_method'] = match_method
-                    tl_torrent['size_mb'] = matched.size / (1024 * 1024)
-                    removed.append(tl_torrent)
-
-                    match_score = 1.0 if match_method == "exact" else 0.0
-                    self._log_removal_to_cache(tl_torrent, matched, match_method, match_score)
-                    logging.info(f"  Matched ({match_method}): '{tl_torrent['name']}'")
+                    tl_torrent['match_score']  = match_score
+                    self._commit_tl_match(tl_torrent, matched, hashes_to_delete, removed)
+                    already_scheduled.add(matched.hash)
                 else:
                     tl_torrent['size_mb'] = tl_torrent.get('size_mb', 0.0)
                     failed_matches.append(tl_torrent)
-                    logging.warning(f"  Failed to match: '{tl_torrent['name']}'")
+                    logging.warning(
+                        f"  Failed to match: '{tl_torrent['name'][:60]}' "
+                        f"(method={match_method})"
+                    )
+                    # Push to retry queue for follow-up on the next cron runs
+                    self.retry_queue.push(
+                        tracker_name=tl_torrent['name'],
+                        tracker_tag="TL",
+                        tracker_size_mb=tl_torrent.get('size_mb'),
+                        failure_reason=match_method,
+                    )
 
             if hashes_to_delete:
                 logging.info(f"Deleting {len(hashes_to_delete)} torrents from qBittorrent...")
@@ -959,9 +961,12 @@ class TorrentLeechMonitor(BaseMonitor):
 
             logging.info(f"\n{'='*80}")
             logging.info(f"MATCHING & REMOVAL SUMMARY:")
-            logging.info(f"  Stalled processed: {len(stalled_torrents)}")
-            logging.info(f"  Matched & removed: {len(removed)}")
-            logging.info(f"  Failed to match: {len(failed_matches)}")
+            logging.info(f"  Stalled processed:   {len(stalled_torrents)}")
+            logging.info(f"  Recovery queue hits: {recovered_count}")
+            logging.info(f"  Retry queue hits:    {retried_count}")
+            logging.info(f"  Matched & removed:   {len(removed)}")
+            logging.info(f"  Failed to match:     {len(failed_matches)}")
+            logging.info(f"  Pending retries:     {self.retry_queue.stats()['pending']}")
             logging.info(f"{'='*80}\n")
 
             qbt_client.auth_log_out()
@@ -974,6 +979,38 @@ class TorrentLeechMonitor(BaseMonitor):
         self._cache_removed_storage(removed, failed_matches)
         self.matcher.save_match_data()
         self._send_consolidated_notification(removed, failed_matches)
+
+    def _commit_tl_match(self, tracker_torrent_dict, qbit_torrent,
+                         hashes_to_delete, removed_list):
+        """
+        Finalise a confirmed TL match: update the tracker dict, append to
+        removed_list, schedule the qBit hash for deletion, and write to
+        lifecycle + removal cache.
+        """
+        match_method = tracker_torrent_dict.get('match_method', 'unknown')
+        match_score  = tracker_torrent_dict.get('match_score', 0.0)
+        qbit_size_mb = qbit_torrent.size / (1024 * 1024)
+
+        hashes_to_delete.append(qbit_torrent.hash)
+        tracker_torrent_dict['size_mb'] = qbit_size_mb
+        removed_list.append(tracker_torrent_dict)
+
+        self.lifecycle.on_removal(
+            qbit_hash=qbit_torrent.hash,
+            qbit_name=qbit_torrent.name,
+            reason=tracker_torrent_dict.get('reason', 'stalled'),
+            scraper='TorrentLeech',
+            tracker_name=tracker_torrent_dict['name'],
+            match_score=match_score,
+            match_method=match_method,
+            size_mb=qbit_size_mb,
+        )
+        self._log_removal_to_cache(tracker_torrent_dict, qbit_torrent,
+                                   match_method, match_score)
+        logging.info(
+            f"  Matched ({match_method}, score={match_score:.3f}): "
+            f"'{tracker_torrent_dict['name'][:60]}'"
+        )
 
     def _send_consolidated_notification(self, removed_list, failed_list):
         if not self.webhook_url:
@@ -1017,9 +1054,7 @@ class TorrentLeechMonitor(BaseMonitor):
         if embeds:
             self._send_discord(embeds, username="TorrentLeech Monitor")
 
-    # ======================================================================
     # HELPERS
-    # ======================================================================
 
     def _parse_days(self, time_str):
         try:
@@ -1029,9 +1064,7 @@ class TorrentLeechMonitor(BaseMonitor):
         except:
             return 0
 
-    # ======================================================================
     # MAIN RUN
-    # ======================================================================
 
     def run(self):
         logging.info("=" * 80)
@@ -1075,7 +1108,7 @@ class TorrentLeechMonitor(BaseMonitor):
             # 5. Apply rules
             stalled = self.apply_removal_rules(scraped, history_data)
 
-            # 6. Process stalled torrents
+            # 6. Process stalled torrents (also drains retry + recovery queues)
             self._process_stalled_torrents(stalled)
 
         except Exception as e:
@@ -1088,7 +1121,6 @@ class TorrentLeechMonitor(BaseMonitor):
             if self.driver:
                 self.driver.quit()
             logging.info("Driver quit.")
-
 
 if __name__ == "__main__":
     monitor = TorrentLeechMonitor()

@@ -4,7 +4,7 @@ import subprocess
 import logging
 from pathlib import Path
 
-MEDIA_PATH = "/volume2/media"
+MEDIA_PATH = os.getenv("MEDIA_PATH", "/mnt/storage/media")
 
 base_dir = Path(__file__).parent.parent.parent
 log_dir = base_dir / 'logs' / 'media'

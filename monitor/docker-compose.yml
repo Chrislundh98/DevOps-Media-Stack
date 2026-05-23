@@ -1,0 +1,27 @@
+services:
+  monitor:
+    build: .
+    container_name: system-monitor
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+      - /dev:/dev:ro
+      - /mnt/disk1:/mnt/disk1:ro
+      - /mnt/disk2:/mnt/disk2:ro
+      - /mnt/parity:/mnt/parity:ro
+      - /mnt/storage:/mnt/storage:ro
+    environment:
+      - SYSTEM_MON_HOOK=${SYSTEM_MON_HOOK}
+      - REPORT_HOUR=${REPORT_HOUR:-8}
+      - REPORT_MINUTE=${REPORT_MINUTE:-0}
+      - DATA_DIR=/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

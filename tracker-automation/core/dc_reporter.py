@@ -14,14 +14,14 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import requests
-from selenium import webdriver
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib import create_chrome_driver
 
 # --- Paths ---
 BASE_DIR = Path(__file__).parent.parent
@@ -29,8 +29,7 @@ LOG_DIR = BASE_DIR / 'logs' / 'digitalcore' / 'stats'
 STORAGE_DIR = BASE_DIR / 'storage'
 JSON_DIR = STORAGE_DIR / 'json'
 COOKIE_FILE_PATH = JSON_DIR / 'dc_cookie.json'
-CHROME_DRIVER_LOG = LOG_DIR / 'chromedriver_dc_stats.log'
-CHROME_PROFILE_DIR = STORAGE_DIR / 'chrome_profile_dc_stats'
+CHROME_PROFILE_DIR = STORAGE_DIR / 'chrome_profiles' / 'dc_stats'
 ACCURACY_LOG_FILE = JSON_DIR / 'accuracy_log_dc.json'
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,63 +50,33 @@ logging.basicConfig(
 
 # --- Configuration ---
 BASE_URL = "https://digitalcore.club"
-PROFILE_URL = "https://digitalcore.club/user/USER_ID/your-username"
+PROFILE_URL = f"{BASE_URL}/user/{os.getenv('DC_USER_ID')}/{os.getenv('DC_USER_HANDLE')}"
 MAX_RETRIES = 3
 
 # --- Selectors ---
 LOGGED_IN_PROOF_SELECTOR = (By.CSS_SELECTOR, "div.table-responsive[ng-show='vm.user']")
 UPLOADED_SELECTOR = (By.XPATH, "//td[contains(text(), 'Uploaded')]/following-sibling::td")
 DOWNLOADED_SELECTOR = (By.XPATH, "//td[contains(text(), 'Downloaded')]/following-sibling::td")
-RATIO_SELECTOR = (By.XPATH, "//td[contains(text(), 'Ratio')]/following-sibling::td/span")
+RATIO_SELECTOR = (By.XPATH, "//td[contains(text(), 'Ratio')]/following-sibling::td")
+RATIO_SPAN_SELECTOR = (By.XPATH, "//td[contains(text(), 'Ratio')]/following-sibling::td/span")
 LEECHBONUS_SELECTOR = (By.XPATH, "//td[contains(text(), 'Leech Bonus')]/following-sibling::td//div[contains(@class, 'progress-bar')]")
 BONUS_POINTS_VALUE_SELECTOR = (By.XPATH, "//td[contains(text(), 'Bonus Points')]/following-sibling::td/b")
 BONUS_POINTS_DETAILS_SELECTOR = (By.XPATH, "//td[contains(text(), 'Bonus Points')]/following-sibling::td/span")
 TRANSFER_STATS_SELECTOR = (By.XPATH, "//span[@translate='USER.PEER_ACTIVITY']")
 HNR_COUNT_SELECTOR = (By.XPATH, "//div[@id='statusBox']//a[@href='/hnr']/following-sibling::b")
 
-
 class DCStatsReporter:
     def __init__(self):
         self.driver = None
         self.webhook_url = os.getenv("DISCORD_STATS_HOOK")
 
-    def _find_chrome_binary(self):
-        possible_paths = [
-            '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/chrome',
-            '/opt/google/chrome/google-chrome', '/snap/bin/chromium',
-            shutil.which('google-chrome'), shutil.which('chromium'),
-            shutil.which('chromium-browser'), shutil.which('chrome')
-        ]
-        for path in possible_paths:
-            if path and os.path.exists(path):
-                logging.info(f"Found Chrome binary at: {path}")
-                return path
-        logging.warning("Could not find Chrome binary automatically.")
-        return None
-
     def setup_chrome_driver(self):
-        logging.info("Setting up standard Chrome driver...")
+        logging.info("Setting up Chrome driver...")
         try:
-            chrome_options = Options()
-            chrome_binary = self._find_chrome_binary()
-            if chrome_binary:
-                chrome_options.binary_location = chrome_binary
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--window-size=1920,1080")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--disable-software-rasterizer")
-            chrome_options.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
-
-            logging.info("Installing/updating ChromeDriver via webdriver_manager...")
-            service = Service(
-                ChromeDriverManager().install(),
-                log_output=str(CHROME_DRIVER_LOG)
+            self.driver = create_chrome_driver(
+                profile_dir=CHROME_PROFILE_DIR,
+                page_load_timeout=120,
             )
-            logging.info("Starting Chrome browser...")
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            self.driver.set_page_load_timeout(120)
             logging.info("Chrome driver created successfully")
             return True
         except Exception as e:
@@ -186,26 +155,20 @@ class DCStatsReporter:
             try:
                 self.driver.get(url)
                 return True
-            except TimeoutException:
-                if attempt < max_retries - 1:
-                    logging.warning(f"Page load timeout (attempt {attempt+1}/{max_retries}). Retrying...")
-                    time.sleep(4)
-                else:
-                    logging.error(f"Failed to load page after {max_retries} attempts: {url}")
-                    return False
             except WebDriverException as e:
-                logging.error(f"WebDriver error loading page: {e}")
-                return False
+                logging.warning(f"Page load attempt {attempt + 1} failed: {e}")
+                time.sleep(2)
+        logging.error(f"Failed to load {url} after {max_retries} attempts")
         return False
 
     def _get_element_text_safe(self, selector, wait_time=10):
         try:
             element = WebDriverWait(self.driver, wait_time).until(EC.visibility_of_element_located(selector))
-            return element.text.strip()
+            return element.text.strip() or "N/A"
         except (NoSuchElementException, TimeoutException):
             return "N/A"
         except Exception as e:
-            logging.error(f"Error getting text for {selector}: {e}")
+            logging.error(f"Error getting element text for {selector}: {e}")
             return "N/A"
 
     def _get_element_attribute_safe(self, selector, attribute, wait_time=10):
@@ -373,7 +336,10 @@ class DCStatsReporter:
 
             stats['uploaded'] = self._get_element_text_safe(UPLOADED_SELECTOR)
             stats['downloaded'] = self._get_element_text_safe(DOWNLOADED_SELECTOR)
-            stats['ratio'] = self._get_element_text_safe(RATIO_SELECTOR)
+            ratio = self._get_element_text_safe(RATIO_SPAN_SELECTOR, wait_time=5)
+            if ratio == "N/A":
+                ratio = self._get_element_text_safe(RATIO_SELECTOR, wait_time=5)
+            stats['ratio'] = ratio
             stats['leech_bonus'] = self._get_element_attribute_safe(LEECHBONUS_SELECTOR, 'aria-valuenow')
             stats['bonus_points_value'] = self._get_element_text_safe(BONUS_POINTS_VALUE_SELECTOR)
             stats['bonus_points_details'] = self._get_element_text_safe(BONUS_POINTS_DETAILS_SELECTOR)
@@ -391,7 +357,6 @@ class DCStatsReporter:
                 time.sleep(1)
                 self.driver.quit()
             logging.info("Driver quit.")
-
 
 if __name__ == "__main__":
     reporter = DCStatsReporter()
